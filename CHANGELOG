@@ -1,4 +1,15 @@
 NEXT VERSION
+  - Tseng ET4000 emulation: Mode 0x24 is unusual in that it is a 130x28
+    text mode with a 13-pixel high character cell. The ET4000 VGA BIOS
+    apparently has a specific font for that mode, so, incorporate that
+    font into DOSBox-X and use it for mode 0x24 (joncampbell123).
+  - Tseng ET4000 emulation: Fix modes 0x22/0x23/0x24 to match how the
+    actual VGA BIOS programs them. This fixes problems where the 132x25
+    mode was rendered only on the upper half of the screen (joncampbell123).
+  - Fix Tseng ET3000/ET4000 emulation bug where CGA graphics modes
+    were garbled. The main VGA emulation no longer uses M_CGA2/M_CGA4
+    and the ET4000 emulation needs to behave the same to fix the
+    graphics modes. Apply fix to ET3000 emulation as well. (joncampbell123).
   - Some extra code in shell processing was preventing drive change commands
     if the last character was a backslash i.e. "a:\" instead of "a:".
     Fixed. (joncampbell123).
