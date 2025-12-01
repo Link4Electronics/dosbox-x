@@ -148,7 +148,7 @@ public:
 		if (host_readb(hostmem+addr)==val) return;
 		host_writeb(hostmem+addr,val);
 		// see if there's code where we are writing to
-		if (!host_readb(&write_map[addr])) {
+		if (!write_map[addr]) {
 			if (active_blocks) return;		// still some blocks in this page
 			active_count--;
 			if (!active_count) Release();	// delay page releasing until active_count is zero
@@ -169,7 +169,7 @@ public:
 		if (host_readw(hostmem+addr)==val) return;
 		host_writew(hostmem+addr,val);
 		// see if there's code where we are writing to
-		if (!host_readw(&write_map[addr])) {
+		if (!*(Bit16u*)&write_map[addr]) {
 			if (active_blocks) return;		// still some blocks in this page
 			active_count--;
 			if (!active_count) Release();	// delay page releasing until active_count is zero
@@ -195,7 +195,7 @@ public:
 		if (host_readd(hostmem+addr)==val) return;
 		host_writed(hostmem+addr,val);
 		// see if there's code where we are writing to
-		if (!host_readd(&write_map[addr])) {
+		if (!*(Bit32u*)&write_map[addr]) {
 			if (active_blocks) return;		// still some blocks in this page
 			active_count--;
 			if (!active_count) Release();	// delay page releasing until active_count is zero
@@ -249,7 +249,7 @@ public:
 		addr&=4095;
 		if (host_readw(hostmem+addr)==val) return false;
 		// see if there's code where we are writing to
-		if (!host_readw(&write_map[addr])) {
+		if (!*(Bit16u*)&write_map[addr]) {
 			if (!active_blocks) {
 				// no blocks left in this page, still delay the page releasing a bit
 				active_count--;
@@ -263,6 +263,7 @@ public:
                 else
                     E_Exit("Memory allocation failed in writew_checked");
 			}
+
 #if defined(WORDS_BIGENDIAN) || !defined(C_UNALIGNED_MEMORY)
 			host_writew(&invalidation_map[addr],
 				host_readw(&invalidation_map[addr])+0x101);
@@ -270,6 +271,7 @@ public:
             if (invalidation_map != NULL)
                 (*(uint16_t*)& invalidation_map[addr]) += 0x101;
 #endif
+
 			if (InvalidateRange(addr,addr+(Bitu)1)) {
 				cpu.exception.which=SMC_CURRENT_BLOCK;
 				return true;
@@ -282,7 +284,7 @@ public:
 		addr&=4095;
 		if (host_readd(hostmem+addr)==val) return false;
 		// see if there's code where we are writing to
-		if (!host_readd(&write_map[addr])) {
+		if (!*(Bit32u*)&write_map[addr]) {
 			if (!active_blocks) {
 				// no blocks left in this page, still delay the page releasing a bit
 				active_count--;
@@ -603,6 +605,8 @@ static INLINE void cache_addq(uint64_t val) {
 
 static void dyn_return(BlockReturnDynRec retcode,bool ret_exception);
 static void dyn_run_code(void);
+static void cache_block_before_close(void);
+static void cache_block_closing(Bit8u* block_start,Bitu block_size);
 
 static bool cache_initialized = false;
 
@@ -714,20 +718,29 @@ static void cache_init(bool enable) {
 		}
 		// setup the default blocks for block linkage returns
 		cache.pos=&cache_code_link_blocks[0];
+        core_dynrec.runcode=(BlockReturn (*)(Bit8u*))cache.pos;
+		// can use op to PAGESIZE_TEMP-64 bytes
+		dyn_run_code();
+		cache_block_before_close();
+		cache_block_closing(cache_code_link_blocks, cache.pos-cache_code_link_blocks);
+
+		cache.pos=&cache_code_link_blocks[PAGESIZE_TEMP-64];
 		link_blocks[0].cache.start=cache.pos;
 		link_blocks[0].cache.xstart=(uint8_t*)cache_rwtox(link_blocks[0].cache.start);
 		// link code that returns with a special return code
+        // must be less than 32 bytes
 		dyn_return(BR_Link1,false);
-		cache.pos=&cache_code_link_blocks[32];
+		cache_block_before_close();
+		cache_block_closing(link_blocks[0].cache.start, cache.pos-link_blocks[0].cache.start);
+
+		cache.pos=&cache_code_link_blocks[PAGESIZE_TEMP-32];
 		link_blocks[1].cache.start=cache.pos;
 		link_blocks[1].cache.xstart=(uint8_t*)cache_rwtox(link_blocks[1].cache.start);
 		// link code that returns with a special return code
+        // must be less than 32 bytes
 		dyn_return(BR_Link2,false);
-
-		cache.pos=&cache_code_link_blocks[64];
-		*(void**)(&core_dynrec.runcode) = (void*)cache_rwtox(cache.pos);
-//		link_blocks[1].cache.start=cache.pos;
-		dyn_run_code();
+        cache_block_before_close();
+		cache_block_closing(link_blocks[1].cache.start, cache.pos-link_blocks[1].cache.start);
 
 		cache.free_pages=nullptr;
 		cache.last_page=nullptr;
