@@ -53,6 +53,19 @@ extern unsigned int vbe_window_granularity;
 extern unsigned int vbe_window_size;
 extern const char* RunningProgram;
 
+static inline void vga_vram_write_trigger_update(void) {
+	vga.draw.must_complete_frame = true;
+}
+
+static inline void vga_cg_write_trigger_update(void) {
+	vga.draw.must_complete_frame = true;
+}
+
+static inline void vga_vram_write_trigger_update_planar_mem(const PhysPt a) {
+	if ((a-(PhysPt)vga.draw.draw_base_planar) < (PhysPt)vga.draw.draw_base_size) /* NTS: Subtract and compare must all use unsigned integers or this won't work! */
+		vga.draw.must_complete_frame = true;
+}
+
 uint32_t tandy_128kbase = 0x80000;
 
 #define TANDY_VIDBASE(_X_)  &MemBase[ tandy_128kbase + (_X_)]
@@ -84,14 +97,17 @@ template <class baseLFBHandler> class VGA_SlowLFBHandler : public baseLFBHandler
 		VGA_SlowLFBHandler() : baseLFBHandler(PFLAG_NOCODE) {}
 		void writeb(PhysPt addr,uint8_t val) override {
 			VGAMEM_USEC_write_delay();
+			vga_vram_write_trigger_update();
 			PageHandler_HostPtWriteB(this,addr,val);
 		}
 		void writew(PhysPt addr,uint16_t val) override {
 			VGAMEM_USEC_write_delay();
+			vga_vram_write_trigger_update();
 			PageHandler_HostPtWriteW(this,addr,val);
 		}
 		void writed(PhysPt addr,uint32_t val) override {
 			VGAMEM_USEC_write_delay();
+			vga_vram_write_trigger_update();
 			PageHandler_HostPtWriteD(this,addr,val);
 		}
 
@@ -405,6 +421,7 @@ public:
 			return 0xFF; /* should not happen, byte I/O is always aligned */
 	}
 	template <typename T=uint8_t> static INLINE void do_write_aligned(const PhysPt a,const T v) {
+		vga_vram_write_trigger_update();
 		*((T*)(&vga.mem.linear[a])) = v;
 	}
 	template <typename T=uint8_t> static INLINE void do_write(const PhysPt a,const T v) {
@@ -461,6 +478,7 @@ public:
 		return VGA_Generic_Read_Handler(addr&~3u, addr, (uint8_t)(addr&3u));
 	}
 	static INLINE void writeHandler8(PhysPt addr, uint8_t val) {
+		vga_vram_write_trigger_update();
 		return VGA_Generic_Write_Handler<true/*chained*/>(addr&~3u, addr, (uint8_t)val);
 	}
 
@@ -516,6 +534,7 @@ public:
 		return VGA_Generic_Read_Handler(addr>>2u, addr, (uint8_t)(addr&3u));
 	}
 	static INLINE void writeHandler8(PhysPt addr, uint8_t val) {
+		vga_vram_write_trigger_update();
 		return VGA_Generic_Write_Handler<true/*chained*/>(addr>>2u, addr, (uint8_t)val);
 	}
 
@@ -568,6 +587,7 @@ public:
 		return VGA_Generic_Read_Handler(addr, addr, vga.config.read_map_select);
 	}
 	static INLINE void writeHandler8(PhysPt addr, uint8_t val) {
+		vga_vram_write_trigger_update_planar_mem(addr);
 		VGA_Generic_Write_Handler<false/*chained*/>(addr, addr, val);
 	}
 
@@ -623,6 +643,7 @@ public:
 	}
 
 	static INLINE void writeHandler8(PhysPt addr, uint8_t val) {
+		vga_vram_write_trigger_update_planar_mem(addr);
 		((uint32_t*)vga.mem.linear)[addr] =
 			(((uint32_t*)vga.mem.linear)[addr] & vga.config.full_not_map_mask) + (ExpandTable[val] & vga.config.full_map_mask);
 	}
@@ -660,6 +681,7 @@ public:
 		return vga.tandy.mem_base[addr];
 	}
 	void writeb(PhysPt addr,uint8_t val) override {
+		vga_vram_write_trigger_update();
 		VGAMEM_USEC_write_delay();
 		addr = PAGING_GetPhysicalAddress(addr) & 0x3FFF;
 		vga.tandy.mem_base[addr] = val;
@@ -689,6 +711,7 @@ public:
 		return vga.tandy.mem_base[addr];
 	}
 	void writeb(PhysPt addr,uint8_t val) override {
+		vga_vram_write_trigger_update();
 		VGAMEM_USEC_write_delay();
 		addr = PAGING_GetPhysicalAddress(addr) & 0xFFFF;
 		vga.tandy.mem_base[addr] = val;
@@ -1568,6 +1591,7 @@ class VGA_PC98_TEXT_PageHandler : public PageHandler {
 		}
 		void writeb(PhysPt addr,uint8_t val) override {
 			addr = PAGING_GetPhysicalAddress(addr) & 0x3FFFu;
+			vga_vram_write_trigger_update();
 
 			if (addr >= 0x3FE0u)
 				return pc98_mem_msw_write((addr >> 2u) & 7u,(unsigned char)val);
@@ -1615,6 +1639,7 @@ class VGA_PC98_CG_PageHandler : public PageHandler {
 		}
 		void writeb(PhysPt addr,uint8_t val) override {
 			/* uses the low 12 bits and therefore does not need PAGING_GetPhysicalAddress() */
+			vga_cg_write_trigger_update();
 			if ((a1_font_load_addr & 0x007E) == 0x0056 && (a1_font_load_addr & 0xFF00) != 0x0000)
 				pc98_font_char_write(a1_font_load_addr,(addr >> 1) & 0xF,addr & 1,val);
 			else
@@ -1677,6 +1702,7 @@ template <const unsigned int bank> class VGA_PC98_256BANK_PageHandler : public P
 			return pc98_vram_256bank_from_window(bank)[PAGING_GetPhysicalAddress(addr) & 0x7FFFu];
 		}
 		void writeb(PhysPt addr,uint8_t val) override {
+			vga_vram_write_trigger_update();
 			pc98_vram_256bank_from_window(bank)[PAGING_GetPhysicalAddress(addr) & 0x7FFFu] = val;
 		}
 };
@@ -1987,6 +2013,7 @@ public:
 	}
 	void writeb(PhysPt addr,uint8_t val) override {
 		VGAMEM_USEC_write_delay();
+		vga_vram_write_trigger_update();
 		writec<uint8_t>( PAGING_GetPhysicalAddress(addr), val );
 	}
 
@@ -2004,6 +2031,7 @@ public:
 	}
 	void writew(PhysPt addr,uint16_t val) override {
 		VGAMEM_USEC_write_delay();
+		vga_vram_write_trigger_update();
 		addr = PAGING_GetPhysicalAddress(addr);
 		if (!(addr & 1)) /* if WORD aligned */
 			writec<uint16_t>(addr,val);
@@ -2056,6 +2084,7 @@ public:
 	}
 	void writeb(PhysPt addr,uint8_t val) override {
 		delay();
+		vga_vram_write_trigger_update();
 		vga.tandy.mem_base[(PAGING_GetPhysicalAddress(addr) - 0xb8000) & 0x3FFF] = val;
 	}
 	
@@ -2083,16 +2112,19 @@ public:
 	VGA_MMIO_Handler() : PageHandler(PFLAG_NOCODE) {}
 	void writeb(PhysPt addr,uint8_t val) override {
 		VGAMEM_USEC_write_delay();
+		vga_vram_write_trigger_update();
 		Bitu port = PAGING_GetPhysicalAddress(addr) & 0xffff;
 		XGA_Write(port, val, 1);
 	}
 	void writew(PhysPt addr,uint16_t val) override {
 		VGAMEM_USEC_write_delay();
+		vga_vram_write_trigger_update();
 		Bitu port = PAGING_GetPhysicalAddress(addr) & 0xffff;
 		XGA_Write(port, val, 2);
 	}
 	void writed(PhysPt addr,uint32_t val) override {
 		VGAMEM_USEC_write_delay();
+		vga_vram_write_trigger_update();
 		Bitu port = PAGING_GetPhysicalAddress(addr) & 0xffff;
 		XGA_Write(port, val, 4);
 	}
@@ -2179,6 +2211,7 @@ public:
 			return (T)do_read_aligned(mapread(a));
 	}
 	template <typename T=uint8_t> static INLINE void do_write_aligned(const PhysPt a,const T v) {
+		vga_vram_write_trigger_update();
 		const uint8_t plane = (vga.mode==M_AMSTRAD) ? vga.amstrad.write_plane : 0x01; // 0x0F?
 		if (plane & 0x08) *((T*)(&vga.tandy.mem_base[a+0xC000u])) = v;
 		if (plane & 0x04) *((T*)(&vga.tandy.mem_base[a+0x8000u])) = v;
@@ -2265,6 +2298,7 @@ public:
 		return latch.b[0];
 	}
 	static INLINE void writeHandler(PhysPt start, uint8_t val) {
+		vga_vram_write_trigger_update();
 		((uint32_t*)vga.mem.linear)[start] = ExpandTable[val];
 	}
 
@@ -2376,6 +2410,7 @@ public:
 				break;
 		}
 
+		vga_vram_write_trigger_update();
 		((uint32_t*)vga.mem.linear)[start] = (((uint32_t*)vga.mem.linear)[start] & nochangemask) + (pl.d & (~nochangemask));
 	}
 
