@@ -1858,26 +1858,40 @@ void FinishSetMode_DOSBoxIG(Bitu /*crtc_base*/, VGA_ModeExtraData* modeData) {
 	htadd *= 8u;
 	vga.config.line_compare=0x7FFu;
 	vga.config.compatible_chain4 = false; /* or else bank switching support does not work properly */
-	ctl = DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE|DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT;
+	ctl = DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE|DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT|DOSBOX_ID_REG_VGAIG_CTL_ACPAL_BYPASS|DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT;
 	switch (CurMode->type) {
 		case M_CGA2:
 			fmtc |= DOSBOX_ID_REG_VGAIG_FMT_1BPP;
 			fmtc |= (uint16_t)(((cwidth+15U)/8U)&(~1U)); // must match code in VESA BIOS emulation
+
+			// must be able to change the palette with 3C6-3C9h
+			ctl &= ~DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT;
 			break;
 		case M_LIN4:
 		case M_EGA:
 			fmtc |= DOSBOX_ID_REG_VGAIG_FMT_1BPP4PLANE;
 			fmtc |= (uint16_t)(((cwidth+15U)/8U)&(~1U)); // must match code in VESA BIOS emulation
-			ctl &= ~DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT; // VGA registers are REQUIRED in order to use planar modes properly
+
+			// VGA registers are REQUIRED in order to use planar modes properly.
+			// DOS games expect the 16-color planar VBE modes to remap colors through the AC palette
+			// such that colors 0-15 become colors 0x00-0x07 and 0x38-0x3F, same as EGA/VGA 16-color and EGA/VGA text mode.
+			// must be able to change the palette with 3C6-3C9h
+			ctl &= ~(DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT|DOSBOX_ID_REG_VGAIG_CTL_ACPAL_BYPASS|DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT);
 			break;
 		case M_PACKED4:
 			fmtc |= DOSBOX_ID_REG_VGAIG_FMT_4BPP;
 			fmtc |= (uint16_t)((((cwidth+15U)/8U)&(~1U))*4); // must match code in VESA BIOS emulation
+
+			// must be able to change the palette with 3C6-3C9h
+			ctl &= ~DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT;
 			break;
 		case M_VGA:
 		case M_LIN8:
 			fmtc |= DOSBOX_ID_REG_VGAIG_FMT_8BPP;
 			fmtc |= cwidth;
+
+			// must be able to change the palette with 3C6-3C9h
+			ctl &= ~DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT;
 			break;
 		case M_LIN15:
 			fmtc |= DOSBOX_ID_REG_VGAIG_FMT_15BPP;
@@ -1939,7 +1953,8 @@ void FinishSetMode_DOSBoxIG(Bitu /*crtc_base*/, VGA_ModeExtraData* modeData) {
 	dosbox_int_pop_save_state();
 
 	/* INT 10h at this point still has the screen blanked, having not yet written bit 5 of the attr control index.
-	 * It won't be able to with our lockout in effect, do it now directly */
+	 * It won't be able to with our lockout in effect, do it now directly.
+	 * 2026/01/07: We could leave it in the blanking state, the VGA draw code ignores this bit in DOSBox IG SVGA mode now, but, we won't */
 	vga.attr.disabled = 0;
 
 	LOG(LOG_MISC,LOG_DEBUG)("DOSBox Integration Device is active");

@@ -689,7 +689,9 @@ typedef struct VGA_DOSBoxIG {
 	bool                    vga_reg_lockout = false; /* lock out standard VGA registers except 3BAh/3DAh and DAC registers */
 	bool                    vga_3da_lockout = false; /* lock out port 3BAh/3DAh */
 	bool                    vga_dac_lockout = false; /* lock out DAC registers */
-	bool			override_refresh = false;
+	bool			vga_acpal_bypass = false; /* VGA DAC bypass AC palette */
+	bool			override_refresh = false; /* force a refresh rate */
+	bool			vesa_bios_lockout = false; /* disable VESA BIOS modesetting (for Windows driver) */
 	unsigned int            width = 0;
 	unsigned int            height = 0;
 	unsigned int		bytes_per_scanline = 0;

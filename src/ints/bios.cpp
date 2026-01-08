@@ -913,6 +913,15 @@ void dosbox_integration_trigger_read() {
 			       dosbox_int_register |= DOSBOX_ID_REG_CPU_CYCLES_INFO_FIXED;
 			break;
 
+		case DOSBOX_ID_REG_VGAIG_CAPS:
+			if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+				dosbox_int_register = DOSBOX_ID_REG_VGA1G_CAPS_ENABLED;
+			}
+			else {
+				dosbox_int_register = 0;
+			}
+			break;
+
 		default:
 			dosbox_int_register = 0xAA55AA55;
 			dosbox_int_error = true;
@@ -1163,7 +1172,9 @@ void dosbox_integration_trigger_write() {
 				vga.dosboxig.override_refresh = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE_REFRESH);
 				if (vga.dosboxig.override_refresh != pv) modechange = true;
 
+				vga.dosboxig.vesa_bios_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_VBEMODESET_DISABLE);
 				vga.dosboxig.vga_reg_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT);
+				vga.dosboxig.vga_acpal_bypass = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_ACPAL_BYPASS);
 				vga.dosboxig.vga_3da_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_3DA_LOCKOUT);
 				vga.dosboxig.vga_dac_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_DAC_LOCKOUT);
 
