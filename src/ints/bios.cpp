@@ -922,6 +922,29 @@ void dosbox_integration_trigger_read() {
 			}
 			break;
 
+		case DOSBOX_ID_REG_VGAIG_CTL:
+			/* Windows 3.1 "grabber" driver needs to be able to save/restore the IG registers,
+			 * or perhaps switch on/off things at runtime. */
+			if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+				dosbox_int_register = vga.dosboxig.ctlreg;
+			}
+			else {
+				dosbox_int_register = 0;
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_DISPLAYSIZE:
+			dosbox_int_register = vga.dosboxig.width | (vga.dosboxig.height << 16u);
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_RBANKWINDOW:
+			dosbox_int_register = vga.dosboxig.rbank_offset;
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_WBANKWINDOW:
+			dosbox_int_register = vga.dosboxig.wbank_offset;
+			break;
+
 		default:
 			dosbox_int_register = 0xAA55AA55;
 			dosbox_int_error = true;
@@ -1161,9 +1184,12 @@ void dosbox_integration_trigger_write() {
 
 		case DOSBOX_ID_REG_VGAIG_CTL: {
 			bool modechange = false;
+			bool mapchange = false;
 			bool pv;
 
 			if (IS_VGA_ARCH && svgaCard == SVGA_DOSBoxIG) {
+				vga.dosboxig.ctlreg = dosbox_int_register;
+
 				pv = vga.dosboxig.svga;
 				vga.dosboxig.svga = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE);
 				if (vga.dosboxig.svga != pv) modechange = true;
@@ -1171,6 +1197,10 @@ void dosbox_integration_trigger_write() {
 				pv = vga.dosboxig.override_refresh;
 				vga.dosboxig.override_refresh = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_OVERRIDE_REFRESH);
 				if (vga.dosboxig.override_refresh != pv) modechange = true;
+
+				pv = vga.dosboxig.force_A0000;
+				vga.dosboxig.force_A0000 = !!(dosbox_int_register & DOSBOX_ID_REG_VGA1G_CTL_A0000_FORCE);
+				if (vga.dosboxig.force_A0000 != pv) mapchange = true;
 
 				vga.dosboxig.vesa_bios_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_VBEMODESET_DISABLE);
 				vga.dosboxig.vga_reg_lockout = !!(dosbox_int_register & DOSBOX_ID_REG_VGAIG_CTL_VGAREG_LOCKOUT);
@@ -1182,6 +1212,10 @@ void dosbox_integration_trigger_write() {
 					VGA_DetermineMode();
 					VGA_StartResize(0);
 					VGA_DAC_UpdateColorPalette();
+				}
+
+				if (mapchange) {
+					VGA_SetupHandlers();
 				}
 			}
 			break; }
@@ -1271,7 +1305,24 @@ void dosbox_integration_trigger_write() {
 		case DOSBOX_ID_REG_VGAIG_BANKWINDOW:
 			{
 				uint32_t nr = dosbox_int_register & (~0xFFFul);
-				vga.dosboxig.bank_offset = nr;
+				vga.dosboxig.rbank_offset = nr;
+				vga.dosboxig.wbank_offset = nr;
+				VGA_SetupHandlers();
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_RBANKWINDOW:
+			{
+				uint32_t nr = dosbox_int_register & (~0xFFFul);
+				vga.dosboxig.rbank_offset = nr;
+				VGA_SetupHandlers();
+			}
+			break;
+
+		case DOSBOX_ID_REG_VGAIG_WBANKWINDOW:
+			{
+				uint32_t nr = dosbox_int_register & (~0xFFFul);
+				vga.dosboxig.wbank_offset = nr;
 				VGA_SetupHandlers();
 			}
 			break;
