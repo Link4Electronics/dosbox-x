@@ -54,6 +54,8 @@
 #include "../libs/zmbv/zmbv.h"
 #endif
 
+#include "../output/output_direct3d11.h"
+
 /* do not issue CPU-side I/O here -- this code emulates functions that the GDC itself carries out, not on the CPU */
 #include "cpu_io_is_forbidden.h"
 
@@ -6229,8 +6231,13 @@ static void VGA_VerticalTimer(Bitu /*val*/) {
 	RENDER_EndUpdate(renderAbort);
 	vga.draw.lines_done = 0;
 
-	//Check if we can actually render, else skip the rest
-	if (vga.draw.vga_override || !RENDER_StartUpdate()) return;
+#if C_DIRECT3D && defined(C_SDL2)
+    if(sdl.desktop.type == SCREEN_DIRECT3D11) {
+        OUTPUT_DIRECT3D11_CheckSourceResolution();
+    }
+#endif
+    //Check if we can actually render, else skip the rest
+    if (vga.draw.vga_override || !RENDER_StartUpdate()) return;
 
 	if (svgaCard == SVGA_S3Trio) {
 		if (s3Card >= S3_ViRGE || s3Card == S3_Trio64V) {
@@ -8403,7 +8410,8 @@ void POD_Save_VGA_Draw( std::ostream& stream )
 
 
 	// - pure data
-	WRITE_POD( &TempLine, TempLine );
+	WRITE_POD( &TempLineSize, TempLineSize );
+	WRITE_POD_SIZE( TempLine, TempLineSize );	
 
 
 	// - system data
@@ -8445,7 +8453,23 @@ void POD_Load_VGA_Draw( std::istream& stream )
 
 
 	// - pure data
-	READ_POD( &TempLine, TempLine );
+	const unsigned int oldTempLineSize = TempLineSize;
+
+	READ_POD( &TempLineSize, TempLineSize );
+
+	if( oldTempLineSize != TempLineSize ) {
+		TempLineFree();
+
+		if(	TempLineAlloc(( TempLineSize - 1024 ) / 4 )) {
+			READ_POD_SIZE( TempLine, TempLineSize );
+		} else {
+			LOG( LOG_VGA, LOG_ERROR )("Savestate load could not allocate TempLine");
+			stream.seekg( TempLineSize, stream.cur );
+		}
+	} else {
+		// read directly into the old address
+		READ_POD_SIZE( TempLine, TempLineSize );
+	}
 
 
 	// - system data
