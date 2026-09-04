@@ -32,6 +32,11 @@
 # endif
 #endif
 
+#if defined(C_DOSBOX_AGENT)
+#include "agent/agent_bridge.h"
+#include "agent/agent_server.h"
+#endif
+
 #ifdef OS2
 # define INCL_DOS
 # define INCL_WIN
@@ -128,6 +133,7 @@ char* revert_escape_newlines(const char* aMessage);
 #endif
 
 #include "control.h"
+#include "dos_inc.h"
 #include "dosbox.h"
 #include "menudef.h"
 #include "pic.h"
@@ -191,6 +197,21 @@ char* revert_escape_newlines(const char* aMessage);
 #include <output/output_tools_xbrz.h>
 static bool init_output = false;
 bool switch_to_d3d11_on_startup = false;
+bool switch_to_metal_on_startup = false;
+
+/* #include <output/output_metal.h> */ // includes Objective-C code
+#if C_METAL
+void metal_init();
+void OUTPUT_Metal_Select();
+Bitu OUTPUT_Metal_GetBestMode(Bitu flags);
+bool OUTPUT_Metal_StartUpdate(uint8_t*& pixels, Bitu& pitch);
+void OUTPUT_Metal_EndUpdate(const uint16_t* changedLines);
+Bitu OUTPUT_Metal_SetSize(void);
+void OUTPUT_Metal_Shutdown();
+void OUTPUT_Metal_CheckSourceResolution();
+#endif
+
+std::string working_dir = ""; // Store working directory 
 
 #if defined(WIN32)
 #include "resource.h"
@@ -721,7 +742,9 @@ bool setSizeButNotResize() {
 
 Bitu time_limit_ms = 0;
 
+#if !defined(OSFREE)
 extern bool keep_umb_on_boot;
+#endif
 extern bool keep_private_area_on_boot;
 bool guest_machine_power_on = false;
 
@@ -729,14 +752,18 @@ std::string custom_savedir;
 
 void SHELL_Run();
 void DisableINT33();
+#if !defined(OSFREE)
 void EMS_DoShutDown();
+#endif
 void XMS_DoShutDown();
 void DOS_DoShutDown();
 void GUS_DOS_Shutdown();
 void SBLASTER_DOS_Shutdown();
 void DOS_ShutdownDevices(void);
+#if !defined(OSFREE)
 void RemoveEMSPageFrame(void);
 void RemoveUMBBlock();
+#endif
 void DOS_GetMemory_unmap();
 void VFILE_Shutdown(void);
 void PROGRAMS_Shutdown(void);
@@ -749,6 +776,7 @@ void FreeBIOSDiskList();
 void GFX_ShutDown(void);
 void MAPPER_Shutdown();
 void SHELL_Init(void);
+void SHELL_MessagesInit(void);
 void CopyClipboard(int all);
 void CopyAllClipboard(bool bPressed);
 void PasteClipboard(bool bPressed);
@@ -757,6 +785,8 @@ void QuickEdit(bool bPressed);
 void ClipKeySelect(int sym);
 bool isModifierApplied(void);
 bool PasteClipboardNext(void);
+void CONFIGSHELL_Init(void);
+void CONFIGSHELL_Run(void);
 
 #if C_DYNAMIC_X86
 void CPU_Core_Dyn_X86_Shutdown(void);
@@ -772,7 +802,7 @@ void UpdateWindowDimensions(Bitu width, Bitu height)
     currentWindowHeight = height;
 }
 
-static Bitu dim_width=0, dim_height=0, dpi_width=0, dpi_height=0;
+static double dim_width=0, dim_height=0, dpi_width=0, dpi_height=0;
 
 void PrintScreenSizeInfo(void) {
 #if 1
@@ -942,7 +972,6 @@ void                        GUI_LoadFonts();
 void                        GUI_Run(bool);
 
 const char*                 titlebar = NULL;
-extern const char*          RunningProgram;
 extern bool                 CPU_CycleAutoAdjust;
 extern                      cpu_cycles_count_t CPU_CyclePercUsed;
 #if !(ENVIRON_INCLUDED)
@@ -958,11 +987,11 @@ bool                        startup_state_capslock = false; // Global for keyboa
 bool                        startup_state_scrlock = false; // Global for keyboard initialisation
 int mouse_start_x=-1, mouse_start_y=-1, mouse_end_x=-1, mouse_end_y=-1, fx=-1, fy=-1, paste_speed=20, wheel_key=0, mbutton=3;
 bool wheel_guest = false, clipboard_dosapi = true, clipboard_biospaste =
-#if defined (WIN32) && (!defined(__MINGW32__) || defined(__MINGW64_VERSION_MAJOR))
-false;
-#else
+//#if defined (WIN32) && (!defined(__MINGW32__) || defined(__MINGW64_VERSION_MAJOR))
+//false;
+//#else
 true;
-#endif
+//#endif
 const char *modifier;
 
 #ifdef WIN32
@@ -1110,12 +1139,18 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
 //  if (timing != -1) internal_timing = timing;
 //  if (frameskip != -1) internal_frameskip = frameskip;
 
+#ifdef C_OSFREE
+    constexpr const char* dosbox_name = "DOSBox-X OSFREE";
+#else
+    constexpr const char* dosbox_name = "DOSBox-X";
+#endif
+
     bool showbasic = section->Get_bool("showbasic");
     if (showbasic) {
-        sprintf(title,"%s%sDOSBox-X %s", dosbox_title.c_str(),dosbox_title.empty()?"":" - ", VERSION);
+        sprintf(title, "%s%s%s %s", dosbox_title.c_str(), dosbox_title.empty() ? "" : " - ", dosbox_name, VERSION);
 
-        const char *what = RunningProgram;
-        if (what != NULL && *what != 0) {
+        const char *what = RunningProgram.c_str();
+        if (!RunningProgram.empty()) {
             char *p = title + strlen(title); // append to end of string
 
             sprintf(p,": %s - ", what);
@@ -1127,7 +1162,7 @@ void GFX_SetTitle(int32_t cycles, int frameskip, Bits timing, bool paused) {
         else
             sprintf(p,"%d cycles/ms", (int)internal_cycles);
     } else
-        sprintf(title,"%s%sDOSBox-X", dosbox_title.c_str(),dosbox_title.empty()?"":" - ");
+        sprintf(title, "%s%s%s", dosbox_title.c_str(), dosbox_title.empty() ? "" : " - ", dosbox_name);
 
     if (!menu.hidecycles) {
         char *p = title + strlen(title); // append to end of string
@@ -1329,7 +1364,7 @@ bool CheckQuit(void) {
             return systemmessagebox("Quit DOSBox-X warning", MSG_Get("QUIT_CONFIRM"),"yesno", "question", 1);
     } else if (warn == "false")
         return true;
-    if (dos_kernel_disabled&&strcmp(RunningProgram, "DOSBOX-X")) {
+    if (dos_kernel_disabled && RunningProgram != "DOSBOX-X") {
         if (!quit) {
             systemmessagebox("Quit DOSBox-X warning", MSG_Get("QUIT_GUEST_DISABLED"),"ok", "warning", 1);
             return false;
@@ -1346,7 +1381,7 @@ bool CheckQuit(void) {
                     return systemmessagebox("Quit DOSBox-X warning", MSG_Get("QUIT_FILE_OPEN_CONFIRM"),"yesno", "question", 1);
             }
         }
-    else if (RunningProgram&&strcmp(RunningProgram, "DOSBOX-X")&&strcmp(RunningProgram, "COMMAND")&&strcmp(RunningProgram, "4DOS")) {
+    else if (!RunningProgram.empty() && RunningProgram != "DOSBOX-X" && RunningProgram != "COMMAND" && RunningProgram != "4DOS") {
         if (!quit) {
             systemmessagebox("Quit DOSBox-X warning",MSG_Get("QUIT_PROGRAM_DISABLED"),"ok", "warning", 1);
             return false;
@@ -1839,6 +1874,8 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
             if(saved_flags & SDL_WINDOW_MAXIMIZED) {
                 SDL_MaximizeWindow(sdl.window);
             }
+            else if(posx < 0 || posy < 0)
+                SDL_SetWindowPosition(sdl.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
             else if(saved_x != SDL_WINDOWPOS_UNDEFINED && saved_y != SDL_WINDOWPOS_UNDEFINED &&
                 !(saved_flags & SDL_WINDOW_MAXIMIZED)) {
                 SDL_SetWindowPosition(sdl.window, saved_x, saved_y); // restore position.
@@ -1876,17 +1913,19 @@ SDL_Window* GFX_SetSDLWindowMode(uint16_t width, uint16_t height, SCREEN_TYPES s
 	/*
 	 * When modeswitching _is_ enabled let's go with sane values.
 	 */
-	bool p_modeswitch = vga.draw.modeswitch_set;
-	if(p_modeswitch) {
-		flags = SDL_WINDOW_FULLSCREEN;
-		width = sdl.draw.width;
-		height = sdl.draw.height;
-	}
+	bool isModeswicthSet = vga.draw.modeswitch_set;
+
 #endif
 
     if (GFX_IsFullscreen()) {
         SDL_DisplayMode displayMode;
         SDL_GetWindowDisplayMode(sdl.window, &displayMode);
+
+	if(isModeswicthSet) {
+		flags = SDL_WINDOW_FULLSCREEN;
+		width = vga.draw.width;
+		height = vga.draw.height;
+	}
 
         displayMode.w = width;
         displayMode.h = height;
@@ -2124,6 +2163,7 @@ bool DOSBox_isMenuVisible(void);
 void MenuShadeRect(int x,int y,int w,int h);
 void MenuDrawRect(int x,int y,int w,int h,Bitu color);
 void GFX_DrawSDLMenu(DOSBoxMenu &menu, DOSBoxMenu::displaylist &dl) {
+    menu.check_layout();
     if (!menu.needsRedraw() || (sdl.updating && !OpenGL_using())) {
         return;
     }
@@ -2141,8 +2181,7 @@ void GFX_DrawSDLMenu(DOSBoxMenu &menu, DOSBoxMenu::displaylist &dl) {
 
     if (&dl == &menu.display_list) { /* top level menu, draw background */
         MenuDrawRect(menu.menuBox.x, menu.menuBox.y, menu.menuBox.w, menu.menuBox.h - 1, GFX_GetRGB(63, 63, 63));
-        MenuDrawRect(menu.menuBox.x, menu.menuBox.y + menu.menuBox.h - 1, menu.menuBox.w, 1,
-                     GFX_GetRGB(31, 31, 31));
+        MenuDrawRect(menu.menuBox.x, menu.menuBox.y + menu.menuBox.h - 1, menu.menuBox.w, 1, GFX_GetRGB(31, 31, 31));
     }
 
     if (mustLock) {
@@ -2253,6 +2292,11 @@ Bitu GFX_SetSize(Bitu width, Bitu height, Bitu flags, double scalex, double scal
             break;
 #endif
 #endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        case SCREEN_METAL:
+            retFlags = OUTPUT_Metal_SetSize();
+            break;
+#endif
 #if defined(USE_TTF)
         case SCREEN_TTF:
             break;
@@ -2321,7 +2365,7 @@ Bitu GFX_SetSize(Bitu width, Bitu height, Bitu flags, double scalex, double scal
     }
 #endif
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU
-    if ((!sdl.desktop.fullscreen && menu_gui && menu.toggle && ((width == 640 || (vga.draw.char9_set && width == 720)) && ((machine != MCH_CGA && !IS_VGA_ARCH && !IS_PC98_ARCH && height == 350) || height == 400))) || ((render.aspect || IS_DOSV) && checkmenuwidth)) {
+    if ((!sdl.desktop.fullscreen && menu_gui && menu.toggle && ((width == 640 || (vga.draw.char9_set && width == 720)) && ((machine != MCH_CGA && machine != MCH_OLIVETTI && machine != MCH_3270PC && !IS_VGA_ARCH && !IS_PC98_ARCH && height == 350) || height == 400))) || ((render.aspect || IS_DOSV) && checkmenuwidth)) {
         RECT r;
         bool res = GetWindowRect(GetHWND(), &r);
         unsigned int maxWidth, maxHeight;
@@ -3229,6 +3273,11 @@ bool GFX_StartUpdate(uint8_t* &pixels,Bitu &pitch)
             break;
 #endif
 #endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        case SCREEN_METAL:
+            return OUTPUT_Metal_StartUpdate(pixels, pitch);
+            break;
+#endif
         default:
             break;
     }
@@ -3269,6 +3318,13 @@ void GFX_EndUpdate(const uint16_t *changedLines) {
     if (sdl.desktop.prevent_fullscreen)
         return;
 
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+    if(sdl.desktop.type == SCREEN_METAL) {
+        sdl.updating = false;
+        goto switch_type;
+    }
+    else
+#endif
 #if C_DIRECT3D
 #if defined(C_SDL2)
     if(sdl.desktop.type == SCREEN_DIRECT3D11) {
@@ -3332,6 +3388,11 @@ switch_type:
             OUTPUT_DIRECT3D11_EndUpdate(changedLines);
             break;
 #endif
+#endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        case SCREEN_METAL:
+            OUTPUT_Metal_EndUpdate(changedLines);
+            break;
 #endif
         default:
             break;
@@ -3410,9 +3471,11 @@ Bitu GFX_GetRGB(uint8_t red, uint8_t green, uint8_t blue) {
 #if defined(C_SDL2)
         case SCREEN_DIRECT3D11:
 #endif
-            return SDL_MapRGB(sdl.surface->format, red, green, blue);
 #endif
-
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        case SCREEN_METAL: // pixelFormat = MTLPixelFormatBGRA8Unorm
+#endif
+            return SDL_MapRGB(sdl.surface->format, red, green, blue);
         default:
             break;
     }
@@ -3466,7 +3529,11 @@ static void GUI_ShutDown(Section * /*sec*/) {
             break;
 #endif
 #endif
-
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        case SCREEN_METAL:
+            OUTPUT_Metal_Shutdown();
+            break;
+#endif
         default:
                 break;
     }
@@ -3612,6 +3679,11 @@ void SendKey(std::string key) {
         KEYBOARD_AddKey(KBD_tab, true);
         KEYBOARD_AddKey(KBD_leftalt, false);
         KEYBOARD_AddKey(KBD_tab, false);
+    } else if (key == "sendkey_altsysrq") {
+        KEYBOARD_AddKey(KBD_leftalt, true);
+        KEYBOARD_AddKey(KBD_printscreen, true);
+        KEYBOARD_AddKey(KBD_leftalt, false);
+        KEYBOARD_AddKey(KBD_printscreen, false);
     } else if (key == "sendkey_ctrlesc") {
         KEYBOARD_AddKey(KBD_leftctrl, true);
         KEYBOARD_AddKey(KBD_esc, true);
@@ -4130,6 +4202,26 @@ static void GUI_StartUp() {
             switch_to_d3d11_on_startup = false;
         }
 #endif
+#endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+    }
+    else if(output == "metal")
+    {
+        if(!init_output) {
+            switch_to_metal_on_startup = true;
+#if C_OPENGL
+            OUTPUT_OPENGL_Select(GLBilinear);
+#else
+            OUTPUT_SURFACE_Select();
+#endif
+            init_output = true;
+        }
+        else {
+            OUTPUT_Metal_Select();
+            metal_init();
+            sdl.desktop.want_type = SCREEN_METAL;
+            switch_to_metal_on_startup = false;
+        }
 #endif
     }
 #if defined(USE_TTF)
@@ -4895,7 +4987,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
     if (button->button == SDL_BUTTON_LEFT) {
         if (button->state == SDL_PRESSED) {
             GFX_SDLMenuTrackHilight(mainMenu,mainMenu.menuUserHoverAt);
-            if (mainMenu.menuUserHoverAt != DOSBoxMenu::unassigned_item_handle) {
+            if (mainMenu.menuUserHoverAt != DOSBoxMenu::unassigned_item_handle && mainMenu.get_item(mainMenu.menuUserHoverAt).is_enabled()) {
                 std::vector<DOSBoxMenu::item_handle_t> popup_stack;
                 DOSBoxMenu::item_handle_t choice_item;
                 DOSBoxMenu::item_handle_t psel_item;
@@ -4910,26 +5002,27 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
                 psel_item = DOSBoxMenu::unassigned_item_handle;
                 choice_item = mainMenu.menuUserHoverAt = mainMenu.menuUserAttentionAt;
 
+                mainMenu.get_item(mainMenu.menuUserAttentionAt).check_layout();
                 popup_stack.push_back(mainMenu.menuUserAttentionAt);
 
 #if C_DIRECT3D
-        if (sdl.desktop.want_type == SCREEN_DIRECT3D) {
-            /* In output=direct3d mode, SDL still has a surface but this code ignores SDL
-             * and draws directly to a Direct3D9 backbuffer which is presented to the window
-             * client area. However, GDI output to the window still works, and this code
-             * uses the SDL surface still. Therefore, for menus to draw correctly atop the
-             * Direct3D output, this code copies the Direct3D backbuffer to the SDL surface
-             * first.
-             *
-             * WARNING: This happens to work with Windows (even Windows 10 build 18xx as of
-             * 2018/05/21) because Windows appears to permit mixing Direct3D and GDI rendering
-             * to the window.
-             *
-             * Someday, if Microsoft should break that ability, this code will need to be
-             * revised to send screen "updates" to the Direct3D backbuffer first, then
-             * Present to the window client area. */
-            if (d3d) d3d->UpdateRectToSDLSurface(0, 0, sdl.surface->w, sdl.surface->h);
-        }
+                if (sdl.desktop.want_type == SCREEN_DIRECT3D) {
+                    /* In output=direct3d mode, SDL still has a surface but this code ignores SDL
+                     * and draws directly to a Direct3D9 backbuffer which is presented to the window
+                     * client area. However, GDI output to the window still works, and this code
+                     * uses the SDL surface still. Therefore, for menus to draw correctly atop the
+                     * Direct3D output, this code copies the Direct3D backbuffer to the SDL surface
+                     * first.
+                     *
+                     * WARNING: This happens to work with Windows (even Windows 10 build 18xx as of
+                     * 2018/05/21) because Windows appears to permit mixing Direct3D and GDI rendering
+                     * to the window.
+                     *
+                     * Someday, if Microsoft should break that ability, this code will need to be
+                     * revised to send screen "updates" to the Direct3D backbuffer first, then
+                     * Present to the window client area. */
+                    if (d3d) d3d->UpdateRectToSDLSurface(0, 0, sdl.surface->w, sdl.surface->h);
+                }
 #endif
 
                 if (OpenGL_using()) {
@@ -5183,7 +5276,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
 
                                     if (sel_item != DOSBoxMenu::unassigned_item_handle) {
                                         if (mainMenu.get_item(sel_item).get_type() == DOSBoxMenu::submenu_type_id) {
-                                            if (!mainMenu.get_item(sel_item).isHilight()) {
+                                            if (!mainMenu.get_item(sel_item).isHilight() && mainMenu.get_item(sel_item).is_enabled()) {
                                                 /* use a copy of the iterator to scan forward and un-hilight the menu items.
                                                  * then use the original iterator to erase from the vector. */
                                                 for (auto ss=search;ss != popup_stack.end();ss++) {
@@ -5195,6 +5288,7 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
 
                                                 popup_stack.erase(search,popup_stack.end());
                                                 mainMenu.get_item(sel_item).setHilight(mainMenu,true).setHover(mainMenu,true);
+                                                mainMenu.get_item(sel_item).check_layout();
                                                 popup_stack.push_back(sel_item);
                                                 redrawAll = true;
                                             }
@@ -6166,7 +6260,7 @@ void GFX_Events() {
                     if((buff = (uint8_t *)malloc(len * 2)) != NULL) {
                         if(CodePageHostToGuestUTF8((char *)buff, event.text.text)) {
                             for(int no = 0 ; buff[no] != 0 ; no++) {
-                                if (IS_PC98_ARCH || isDBCSCP()) {
+                                if (IS_PC98_ARCH ) {
                                     if(dos.loaded_codepage == 932 && isKanji1(buff[no]) && isKanji2(buff[no + 1])) {
 #if defined(MACOSX)
                                         if (buff[no] == 0x81 && buff[no + 1] == 0x40) no++;
@@ -6394,7 +6488,7 @@ void GFX_Events() {
                             GFX_CaptureMouse();
                         SetPriority(sdl.priority.focus);
                         CPU_Disable_SkipAutoAdjust();
-                        if (strcmp(RunningProgram, "LOADLIN") && IsSafeToMemIOOnBehalfOfGuest()) {
+                        if (RunningProgram != "LOADLIN" && IsSafeToMemIOOnBehalfOfGuest()) {
                             BIOS_SynchronizeNumLock();
                             BIOS_SynchronizeCapsLock();
                             BIOS_SynchronizeScrollLock();
@@ -6531,8 +6625,9 @@ void GFX_Events() {
                     uname[0]=event.key.keysym.unicode;
                     uname[1]=0;
                     if (CodePageHostToGuestUTF16(chars, uname)) {
-                        for (size_t i=0; i<strlen(chars); i++) {
-                            if (dos.loaded_codepage == 932 && strlen(chars) == 2 && isKanji1(chars[0]))
+                        size_t char_length = strlen(chars);
+                        for (size_t i=0; i< char_length; i++) {
+                            if (IS_PC98_ARCH && dos.loaded_codepage == 932 && char_length == 2 && isKanji1(chars[0]))
                                 BIOS_AddKeyToBuffer((i==0?0xf100:0xf000) | (unsigned char)chars[i]);
                             else
                                 BIOS_AddKeyToBuffer((unsigned char)chars[i]);
@@ -6587,8 +6682,9 @@ void GFX_Events() {
                             uname[0]=buff[no];
                             uname[1]=0;
                             if (CodePageHostToGuestUTF16(chars, uname)) {
-                                for (size_t i=0; i<strlen(chars); i++) {
-                                    if (dos.loaded_codepage == 932 && strlen(chars) == 2 && isKanji1(chars[0]))
+                                size_t char_length = strlen(chars);
+                                for (size_t i=0; i< char_length; i++) {
+                                    if (IS_PC98_ARCH && dos.loaded_codepage == 932 && char_length == 2 && isKanji1(chars[0]))
                                         BIOS_AddKeyToBuffer((i==0?0xf100:0xf000) | (unsigned char)chars[i]);
                                     else
                                         BIOS_AddKeyToBuffer((unsigned char)chars[i]);
@@ -6749,16 +6845,24 @@ void SDL_SetupConfigSection() {
     Pstring->SetBasic(true);
 
     const char* outputs[] = {
-        "default", "surface", "overlay", "ttf",
+        "default", "surface",
+#if defined(USE_TTF)
+        "ttf",
+#endif
 #if C_OPENGL
         "opengl", "openglnb", "openglhq", "openglpp",
 #endif
 #if C_GAMELINK
         "gamelink",
 #endif
-        "ddraw",
 #if C_DIRECT3D
-        "direct3d", "direct3d11",
+        "direct3d",
+#if defined(C_SDL2)
+        "direct3d11",
+#endif
+#endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+        "metal",
 #endif
         nullptr };
 
@@ -7384,6 +7488,10 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -log-fileio                             Log file I/O through INT 21h (debug level)\n");
             fprintf(stderr,"  -nolog                                  Do not log anything to log file\n");
             fprintf(stderr,"  -tests                                  Run unit tests to test the DOSBox-X code\n");
+#if defined(C_DOSBOX_AGENT)
+            fprintf(stderr,"  -agent-config <path>                    Load agent configuration from an explicit file\n");
+            fprintf(stderr,"  -agent-self-test                        Verify agent startup and emulation queue behavior\n");
+#endif
             fprintf(stderr,"  -print-ticks                            (Debug) Print emulator time and SDL_GetTicks()\n");
             fprintf(stderr,"  -force-gfx-hardware                     Force render scaler system to act as if GFX_HARDWARE\n");
             fprintf(stderr,"\n");
@@ -7409,6 +7517,14 @@ bool DOSBOX_parse_argv() {
         else if (optname == "log-con") {
             control->opt_log_con = true;
         }
+#if defined(C_DOSBOX_AGENT)
+        else if (optname == "agent-config") {
+            if (!control->cmdline->NextOptArgv(control->opt_agent_config)) return false;
+        }
+        else if (optname == "agent-self-test") {
+            control->opt_agent_self_test = true;
+        }
+#endif
         else if (optname == "nolog") {
             control->opt_nolog = true;
         }
@@ -7731,13 +7847,19 @@ void PARALLEL_Init();
 void DONGLE_Init();
 void DOS_Init();
 void XMS_Init();
+#if !defined(OSFREE)
 void EMS_Init();
+#endif
 void MOUSE_Init();
+#if !defined(OSFREE)
 void DOS_KeyboardLayout_Init();
+#endif
 void CDROM_Image_Init();
 void MSCDEX_Init();
 void DRIVES_Init();
+#if !defined(OSFREE)
 void IPX_Init();
+#endif
 void IDE_Init();
 void NE2K_Init();
 void FDC_Primary_Init();
@@ -7785,8 +7907,10 @@ void Windows_DPI_Awareness_Init() {
 
 bool VM_Boot_DOSBox_Kernel() {
     if (!dos_kernel_disabled) {
+#if !defined(OSFREE)
         RemoveEMSPageFrame();
         RemoveUMBBlock();
+#endif
         DisableINT33();
         DOS_GetMemory_unmap();
         VFILE_Shutdown();
@@ -7794,7 +7918,9 @@ bool VM_Boot_DOSBox_Kernel() {
         DOS_UninstallMisc();
         SBLASTER_DOS_Shutdown();
         GUS_DOS_Shutdown();
+#if !defined(OSFREE)
         EMS_DoShutDown();
+#endif
         XMS_DoShutDown();
         DOS_DoShutDown();
 
@@ -7836,17 +7962,28 @@ bool VM_Boot_DOSBox_Kernel() {
         /* Date/time */
         DOS_InitClock();
 
+#if !defined(OSFREE)
         /* keyboard mapping, at this point in CONFIG.SYS parsing, right? */
         void DOS_KeyboardLayout_Startup(Section* sec);
         DOS_KeyboardLayout_Startup(NULL);
+#endif
 
         /* Most MS-DOS installations have a DEVICE=C:\HIMEM.SYS somewhere near the top of their CONFIG.SYS */
         void XMS_Startup(Section *sec);
         XMS_Startup(NULL);
 
+#if !defined(OSFREE)
         /* And then after that, usually a DEVICE=C:\EMM386.EXE just after HIMEM.SYS */
         void EMS_Startup(Section* sec);
         EMS_Startup(NULL);
+#endif
+
+        /* possible return to DOSBox-X DOS environment */
+        mainMenu.get_item("HelpCommandMenu").enable();
+
+        SHELL_MessagesInit();
+        CONFIGSHELL_Init();
+        CONFIGSHELL_Run();
 
         DispatchVMEvent(VM_EVENT_DOS_INIT_CONFIG_SYS_DONE); // <- we just finished executing CONFIG.SYS
         SHELL_Init(); // <- NTS: this will change CPU instruction pointer!
@@ -7990,6 +8127,15 @@ bool custom_bios = false;
 size_t custom_bios_image_size = 0;
 Bitu custom_bios_image_offset = 0;
 unsigned char *custom_bios_image = NULL;
+
+/* 2026/06/07: We now accept from BOOT a boot sector to load into memory
+ *             after DOS kernel shutdown, so that the process shutdown
+ *             is cleaner and the "don't check MCB corruption" flag is
+ *             no longer necessary. */
+std::vector<uint8_t> boot_code_image;
+PhysPt boot_code_image_load_to = 0;
+uint16_t boot_code_image_stack_ss = 0;
+uint16_t boot_code_image_stack_sp = 0;
 
 // OK why isn't this being set for Linux??
 #ifndef SDL_MAIN_NOEXCEPT
@@ -8256,6 +8402,11 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     CommandLine com_line(argc,argv);
     Config myconf(&com_line);
     bool saved_opt_test;
+#if defined(C_DOSBOX_AGENT)
+    dosbox_agent::AgentServer agent_server;
+#endif
+
+    srand(time(NULL));
 
     control=&myconf;
 
@@ -8284,6 +8435,34 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
     /* -- Early logging init, in case these details are needed to debug problems at this level */
     /*    If --early-debug was given this opens up logging to STDERR until Log::Init() */
     LOG::EarlyInit();
+
+#if defined(C_DOSBOX_AGENT)
+    if (control->opt_agent_self_test && control->opt_agent_config.empty()) {
+        LOG_MSG("Agent self-test requires --agent-config <path>");
+        return 1;
+    }
+    if (!control->opt_agent_config.empty()) {
+        std::string agent_error;
+        if (!agent_server.StartFromConfigFile(control->opt_agent_config, &agent_error)) {
+            LOG_MSG("Agent startup failed: %s", agent_error.c_str());
+            return 1;
+        }
+        LOG_MSG("%s", dosbox_agent::AGENT_FormatStartupLog(*agent_server.GetConfig()).c_str());
+    }
+    if (control->opt_agent_self_test) {
+        std::string agent_error;
+        if (!dosbox_agent::AGENT_RunQueueSelfTest(&agent_error)) {
+            LOG_MSG("Agent queue self-test failed: %s", agent_error.c_str());
+            return 1;
+        }
+        if (!agent_server.RunProtocolSelfTest(&agent_error)) {
+            LOG_MSG("Agent protocol self-test failed: %s", agent_error.c_str());
+            return 1;
+        }
+        LOG_MSG("Agent self-test completed: success");
+        return 0;
+    }
+#endif
 
     /* -- Init the configuration system and add default values */
     CheckNumLockState();
@@ -8439,42 +8618,96 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
     configfile = "";
     exepath = GetDOSBoxXPath();
+    std::string config_path = Cross::GetPlatformConfigDir();
     std::string workdiropt = "default";
     std::string workdirdef = "";
+    std::string res_path = Cross::GetPlatformResDir();
+    std::string tmp = Cross::GetPlatformConfigName();
+    std::string config_combined = config_path + tmp;
+    bool default_config = false;
+
     struct stat st;
-    if (!control->opt_defaultconf && control->config_file_list.empty() && stat("dosbox-x.conf", &st) && stat("dosbox.conf", &st)) {
-        /* load the global config file first */
-        std::string tmp,config_path,config_combined;
 
-        /* -- Parse configuration files */
-        config_path = Cross::GetPlatformConfigDir();
-        tmp = Cross::GetPlatformConfigName();
+    control->ParseConfigFile(config_combined.c_str());
+    if(!control->configfiles.size() && config_combined.size()) {
+        control->PrintConfig(config_combined.c_str()); // create a default userconfig file if it doesn't exist
+    }
+    else {
+        control->ClearExtraData();
+        control->configfiles.clear();
+    }
 
-        if (exepath.size()) {
-            control->ParseConfigFile((exepath + "dosbox-x.conf").c_str());
-            if (!control->configfiles.size()) control->ParseConfigFile((exepath + "dosbox.conf").c_str());
+    if(!control->opt_defaultconf) {
+        if(control->opt_userconf) {
+            control->ParseConfigFile(config_combined.c_str()); // Load the userconfig file if -userconf option is specified on the command line
+            if(control->configfiles.size()) configfile = config_combined;
         }
 
+        if(control->config_file_list.size()) {
+            for(size_t si = 0; si < control->config_file_list.size(); si++) {
+                std::string configfile_path = control->config_file_list[si]; // use config files specified by -conf option on the command line
+                if(!control->config_file_list[si].empty()) control->ParseConfigFile(configfile_path.c_str());
+                if(control->configfiles.size()) configfile = configfile_path;
+            }
+        }
+
+        /* -- Search for configuration files */
+        if(!control->configfiles.size()) {
+            /* First search the current directory */
+            control->ParseConfigFile("dosbox-x.conf");
+            if(control->configfiles.size()) configfile = "dosbox-x.conf";
+            else {
+                control->ParseConfigFile("dosbox.conf");
+                if(control->configfiles.size()) configfile = "dosbox.conf";
+            }
+            if(control->configfiles.size()) {
+                std::string cur_dir = Cross::GetCurDir();
+                configfile = cur_dir + configfile;
+                default_config = true;
+            }
+        }
+
+        /* If conf file not found, search the directory where the executable exists */
+        if (!control->configfiles.size() && exepath.size()) {
+            control->ParseConfigFile((exepath + "dosbox-x.conf").c_str());
+            if(control->configfiles.size()) configfile = exepath + "dosbox-x.conf";
+            else {
+                control->ParseConfigFile((exepath + "dosbox.conf").c_str());
+                if(control->configfiles.size()) configfile = exepath + "dosbox.conf";
+            }
+        }
+
+        /* If conf file still not found, search the userconfig */
         config_combined = config_path + "dosbox-x.conf";
-        if (!control->configfiles.size() && stat(config_combined.c_str(),&st) == 0 && S_ISREG(st.st_mode))
+        if(!control->configfiles.size() && stat(config_combined.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
             control->ParseConfigFile(config_combined.c_str());
+            if(control->configfiles.size()) configfile = config_combined;
+        }
+        config_combined = config_path + "dosbox.conf";
+        if(!control->configfiles.size() && stat(config_combined.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+            control->ParseConfigFile(config_combined.c_str());
+            if(control->configfiles.size()) configfile = config_combined;
+        }
 
         config_combined = config_path + tmp;
-        if (!control->configfiles.size() && stat(config_combined.c_str(),&st) == 0 && S_ISREG(st.st_mode))
+        if (!control->configfiles.size() && stat(config_combined.c_str(),&st) == 0 && S_ISREG(st.st_mode)) {
             control->ParseConfigFile(config_combined.c_str());
+            if(control->configfiles.size()) configfile = config_combined;
+        }
+    }
 
-        if (control->configfiles.size()) configfile = control->configfiles.front();
-
-        Section_prop *section = static_cast<Section_prop *>(control->GetSection("dosbox"));
+    if(control->configfiles.size()) {
+        Section_prop* section = static_cast<Section_prop*>(control->GetSection("dosbox"));
         workdiropt = section->Get_string("working directory option");
         workdirdef = section->Get_path("working directory default")->realpath;
         std::string resolvestr = section->Get_string("resolve config path");
-        resolveopt = resolvestr=="true"||resolvestr=="1"?1:(resolvestr=="dosvar"?2:(resolvestr=="tilde"?3:0));
-        void ResolvePath(std::string& in);
+        resolveopt = resolvestr == "true" || resolvestr == "1" ? 1 : (resolvestr == "dosvar" ? 2 : (resolvestr == "tilde" ? 3 : 0));
+        void ResolvePath(std::string & in);
         ResolvePath(workdirdef);
 
         control->ClearExtraData();
         control->configfiles.clear();
+        // LOG_MSG("working directory default=%s, working directory option=%s", workdiropt.c_str(), workdirdef.c_str());
     }
 
     if (workdiropt == "prompt" && control->opt_promptfolder < 0) control->opt_promptfolder = 1;
@@ -8485,13 +8718,12 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         control->opt_used_defaultdir = true;
         usecfgdir = false;
     } else if (workdiropt == "userconfig") {
-        std::string config_path;
-        config_path = Cross::GetPlatformConfigDir();
         if (config_path.size()) {
             if (chdir(config_path.c_str()) == -1) {
                 LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to change directories for workdiropt 'userconfig'.");
             }
         }
+        control->opt_promptfolder = 0;
         control->opt_used_defaultdir = true;
         usecfgdir = false;
     } else if (workdiropt == "program") {
@@ -8501,15 +8733,17 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
                 LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to change directories for workdiropt 'program'.");
             }
         }
+        control->opt_promptfolder = 0;
         control->opt_used_defaultdir = true;
         usecfgdir = false;
     } else if (workdiropt == "config") {
+        control->opt_promptfolder = 0;
         control->opt_used_defaultdir = true;
         usecfgdir = true;
     }
 
     /* default do not prompt if -set, -conf, -userconf, -defaultconf, or -defaultdir is used */
-    if (control->opt_promptfolder < 0 && (!control->config_file_list.empty() || !control->opt_set.empty() || control->opt_userconf || control->opt_defaultconf || control->opt_used_defaultdir || control->opt_fastlaunch || control->opt_test || workdiropt == "noprompt")) {
+    if (control->opt_promptfolder < 0 && (!control->config_file_list.empty() || control->opt_userconf || !control->opt_set.empty() || control->opt_defaultconf || control->opt_used_defaultdir || control->opt_fastlaunch || control->opt_test || workdiropt == "noprompt")) {
         control->opt_promptfolder = 0;
     }
 
@@ -8518,43 +8752,26 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 
 #if defined(MACOSX) || defined(LINUX) || (defined(WIN32) && !defined(HX_DOS))
     {
-        if(control->opt_promptfolder < 0) {
-#if !defined(MACOSX)
-            struct stat st;
-
-            /* if dosbox.conf or dosbox-x.conf already exists in the current working directory, then skip folder prompt */
-            if(stat("dosbox-x.conf", &st) == 0 || stat("dosbox.conf", &st) == 0) {
-                if(S_ISREG(st.st_mode)) {
-                    control->opt_promptfolder = 0;
-                }
-            }
-#endif
-            std::string res_path;
-            res_path = Cross::GetPlatformResDir();
-            if(stat((res_path + "dosbox-x.conf").c_str(), &st) == 0) {
-                if(S_ISREG(st.st_mode)) {
-                    control->opt_promptfolder = 0;
-                }
-            }
-        }
-
 #if defined(WIN32)
         /* A Windows application cannot detect with isatty() if run from the command prompt.
         *  isatty() returns true even though STDIN/STDOUT/STDERR do not exist even if run from the command prompt. */
         if (control->opt_promptfolder < 0)
-            control->opt_promptfolder = 1;
+            control->opt_promptfolder = !default_config ? 1 : 0;
 #else
         std::unique_ptr<char[]> cwd(new char[PATH_MAX]);
         if (control->opt_promptfolder < 0 && getcwd(cwd.get(), PATH_MAX) != nullptr)
-            control->opt_promptfolder = (!isatty(0) || !strcmp(cwd.get(), "/")) ? 1 : 0;
+            control->opt_promptfolder = ((!isatty(0) && !default_config) || !strcmp(cwd.get(), "/") || ((workdiropt == "default" && !default_config) || workdiropt == "autoprompt")) ? 1 : 0;
 #endif
-        if (control->opt_promptfolder == 1 && workdiropt == "default" && workdirdef.size()) {
+        if (control->opt_promptfolder == 1 && (workdiropt == "default" || workdiropt == "autoprompt") && workdirdef.size()) {
             control->opt_promptfolder = 0;
             if(chdir(workdirdef.c_str()) == -1) {
                 LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to change directories for workdiropt 'default'.");
+                control->opt_promptfolder = 1;
             }
-            control->opt_used_defaultdir = true;
-            usecfgdir = false;
+            else {
+                control->opt_used_defaultdir = true;
+                usecfgdir = false;
+            }
         }
 
         /* When we're run from the Finder, the current working directory is often / (the
@@ -8659,18 +8876,20 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
                     return 1;
                 }
 #endif
-                LOG_MSG("User selected folder '%s', making that the current working directory.\n",path.c_str());
+#if defined(WIN32) && !defined(HX_DOS)
+                int len = WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, nullptr, 0, nullptr, nullptr);
+                std::string utf8(len - 1, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, &utf8[0], len, nullptr, nullptr);
+                LOG_MSG("User selected folder '%s', making that the current working directory.", utf8.c_str());
+#else
+                LOG_MSG("User selected folder '%s', making that the current working directory.", path.c_str());
+#endif 
                 control->opt_used_defaultdir = true;
             }
         }
     }
 #endif
-    std::string tmp, config_path, res_path, config_combined;
     /* -- Parse configuration files */
-    config_path = Cross::GetPlatformConfigDir();
-    res_path = Cross::GetPlatformResDir();
-    tmp = Cross::GetPlatformConfigName();
-    config_combined = config_path + tmp;
     {
 
 #if defined(WIN32) && !defined(C_SDL2) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
@@ -8708,9 +8927,10 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             }
         }
 
-        /* -- -- first the user config file */
+        tmp = Cross::GetPlatformConfigName();
+        config_combined = config_path + tmp;
+        /* -- -- first handle the -userconf option */
         if (control->opt_userconf || workdirsave>0) {
-
             LOG(LOG_MISC,LOG_DEBUG)("Loading config file according to -userconf from %s",config_combined.c_str());
             control->ParseConfigFile(config_combined.c_str());
             if (!control->configfiles.size()) {
@@ -8723,7 +8943,6 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
                         tsec->HandleInputline("working directory option=autoprompt");
                 }
                 //Try to create the userlevel configfile.
-                config_path = Cross::CreatePlatformConfigDir();
 
                 LOG(LOG_MISC,LOG_DEBUG)("Attempting to write config file according to -userconf, to %s",config_combined.c_str());
                 if (control->PrintConfig(config_combined.c_str())) {
@@ -8760,15 +8979,10 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         }
 
     if (!control->opt_defaultconf) {
-        /* -- -- if none found, use dosbox-x.conf or dosbox.conf */
-        std::string cur_dir;
-        std::unique_ptr<char[]> cwd(new char[PATH_MAX]);
-        if(getcwd(cwd.get(), PATH_MAX) != nullptr) {
-            cur_dir = std::string(cwd.get()) + CROSS_FILESPLIT;
-        }
-        else {
-            cur_dir.clear();
-        }
+        /* -- -- if -userconf and -conf option not found, search for conf files */
+        /* Current directory -> Program directory -> User config directory      */
+
+        std::string cur_dir = Cross::GetCurDir();
         const std::string config_paths[] = {
             cur_dir + "dosbox-x.conf",
             cur_dir + "dosbox.conf",
@@ -8776,6 +8990,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
             exepath.empty() ? "" : exepath + "dosbox.conf",
             res_path.empty() ? "": res_path + "dosbox-x.conf", /* resource level conf */
             config_path.empty() ? "" : config_path + "dosbox-x.conf", /* user level conf */
+            config_path.empty() ? "" : config_path + "dosbox.conf", /* user level conf */
             config_combined /* user level conf (default name)*/
         };
 
@@ -9078,6 +9293,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 		}
 
     {
+        /**
         Section_prop *section = static_cast<Section_prop *>(control->GetSection("dosbox"));
         workdiropt = section->Get_string("working directory option");
         workdirdef = section->Get_path("working directory default")->realpath;
@@ -9090,8 +9306,6 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
                 LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to change directories for workdiropt 'custom' or 'force'.");
             }
         } else if (workdiropt == "userconfig") {
-            std::string config_path;
-            config_path = Cross::GetPlatformConfigDir();
             if(config_path.size()) {
                 if(chdir(config_path.c_str()) == -1) {
                     LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to change directories for workdiropt 'userconfig'.");
@@ -9110,36 +9324,36 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
                 }
             }
         }
+        */
+        working_dir = Cross::GetCurDir();
+        if(working_dir.empty())
+            LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to get the current working directory.");
+        else
+            LOG_MSG("DOSBox-X's working directory: %s\n", working_dir.c_str());
 
-        {
-            std::unique_ptr<char[]> cwd(new char[PATH_MAX]);
-            if(getcwd(cwd.get(), PATH_MAX))
-                LOG_MSG("DOSBox-X's working directory: %s\n", cwd.get());
-            else
-                LOG(LOG_GUI, LOG_ERROR)("sdlmain.cpp main() failed to get the current working directory.");
-        }
-    const char *imestr = section->Get_string("ime");
-    enableime = !strcasecmp(imestr, "true") || !strcasecmp(imestr, "1");
-    if (!strcasecmp(imestr, "auto")) {
-        const char *machine = section->Get_string("machine");
-        if (!strcasecmp(machine, "pc98") || !strcasecmp(machine, "pc9801") || !strcasecmp(machine, "pc9821") || !strcasecmp(machine, "jega") || strcasecmp(static_cast<Section_prop *>(control->GetSection("dosv"))->Get_string("dosv"), "off")) enableime = true;
-        else {
-            force_conversion = true;
-            int cp=dos.loaded_codepage;
-            if (InitCodePage() && isDBCSCP()) enableime = true;
-            else if (control->opt_langcp) tonoime = true;
-            force_conversion = false;
-            dos.loaded_codepage=cp;
+        Section_prop* section = static_cast<Section_prop*>(control->GetSection("dosbox"));
+        const char *imestr = section->Get_string("ime");
+        enableime = !strcasecmp(imestr, "true") || !strcasecmp(imestr, "1");
+        if (!strcasecmp(imestr, "auto")) {
+            const char *machine = section->Get_string("machine");
+            if (!strcasecmp(machine, "pc98") || !strcasecmp(machine, "pc9801") || !strcasecmp(machine, "pc9821") || !strcasecmp(machine, "jega") || strcasecmp(static_cast<Section_prop *>(control->GetSection("dosv"))->Get_string("dosv"), "off")) enableime = true;
+            else {
+                force_conversion = true;
+                int cp=dos.loaded_codepage;
+                if (InitCodePage() && isDBCSCP()) enableime = true;
+                else if (control->opt_langcp) tonoime = true;
+                force_conversion = false;
+                dos.loaded_codepage=cp;
 #if defined (WIN32)
-            if (!enableime&&!tonoime) {
-                const Section_prop* section = static_cast<Section_prop*>(control->GetSection("dos"));
-                const char * layoutname=section->Get_string("keyboardlayout");
-                WORD cur_kb_layout = LOWORD(GetKeyboardLayout(0));
-                if (!strcmp(layoutname, "jp") || !strcmp(layoutname, "ko") || !strcmp(layoutname, "cn") || !strcmp(layoutname, "tw") || !strcmp(layoutname, "hk") || !strcmp(layoutname, "zh") || !strcmp(layoutname, "zhs") || !strcmp(layoutname, "zht") || (!strcmp(layoutname, "auto") && (cur_kb_layout == 1028 || cur_kb_layout == 1041 || cur_kb_layout == 1042 || cur_kb_layout == 2052 || cur_kb_layout == 3076))) enableime = true;
-            }
+                if (!enableime&&!tonoime) {
+                    const Section_prop* section = static_cast<Section_prop*>(control->GetSection("dos"));
+                    const char * layoutname=section->Get_string("keyboardlayout");
+                    WORD cur_kb_layout = LOWORD(GetKeyboardLayout(0));
+                    if (!strcmp(layoutname, "jp") || !strcmp(layoutname, "ko") || !strcmp(layoutname, "cn") || !strcmp(layoutname, "tw") || !strcmp(layoutname, "hk") || !strcmp(layoutname, "zh") || !strcmp(layoutname, "zhs") || !strcmp(layoutname, "zht") || (!strcmp(layoutname, "auto") && (cur_kb_layout == 1028 || cur_kb_layout == 1041 || cur_kb_layout == 1042 || cur_kb_layout == 2052 || cur_kb_layout == 3076))) enableime = true;
+                }
 #endif
+            }
         }
-    }
 #if defined(WIN32) && !defined(HX_DOS) && !defined(_WIN32_WINDOWS)
         if (!enableime&&!tonoime) ImmDisableIME((DWORD)(-1));
 #endif
@@ -9183,6 +9397,10 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 #if defined(MACOSX)
         LOG_MSG("macOS EXE path: %s",MacOSXEXEPath.c_str());
         LOG_MSG("macOS Resource path: %s",MacOSXResPath.c_str());
+#endif
+
+#if defined(OSFREE)
+	LOG_MSG("DOSBox-X OS-Free build -- Built-in MS-DOS emulation is not available");
 #endif
 
         /* -- [debug] setup console */
@@ -9627,13 +9845,19 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         /* OS init now */
         DOS_Init();
         DRIVES_Init();
+#if !defined(OSFREE)
         DOS_KeyboardLayout_Init();
+#endif
         MOUSE_Init(); // FIXME: inits INT 15h and INT 33h at the same time. Also uses DOS_GetMemory() which is why DOS_Init must come first
         XMS_Init();
+#if !defined(OSFREE)
         EMS_Init();
+#endif
         AUTOEXEC_Init();
-#if C_IPX
+#if !defined(OSFREE)
+# if C_IPX
         IPX_Init();
+# endif
 #endif
         MSCDEX_Init();
         CDROM_Image_Init();
@@ -9717,8 +9941,8 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
         mainMenu.get_item("doublescan").enable(!IS_PC98_ARCH);
 
         blinking=static_cast<Section_prop *>(control->GetSection("video"))->Get_bool("high intensity blinking");
-        mainMenu.get_item("text_background").enable(!IS_PC98_ARCH&&machine!=MCH_CGA).check(!blinking).refresh_item(mainMenu);
-        mainMenu.get_item("text_blinking").enable(!IS_PC98_ARCH&&machine!=MCH_CGA).check(blinking).refresh_item(mainMenu);
+        mainMenu.get_item("text_background").enable(!IS_PC98_ARCH&&machine!=MCH_CGA&&machine!=MCH_OLIVETTI&&machine!=MCH_3270PC).check(!blinking).refresh_item(mainMenu);
+        mainMenu.get_item("text_blinking").enable(!IS_PC98_ARCH&&machine!=MCH_CGA&&machine!=MCH_OLIVETTI&&machine!=MCH_3270PC).check(blinking).refresh_item(mainMenu);
         mainMenu.get_item("line_80x25").enable(!IS_PC98_ARCH);
         mainMenu.get_item("line_80x43").enable(!IS_PC98_ARCH);
         mainMenu.get_item("line_80x50").enable(!IS_PC98_ARCH);
@@ -9791,6 +10015,9 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 #ifdef USE_TTF
         mainMenu.get_item("load_ttf_font").enable(TTF_using());
 #endif
+
+        /* why show PC-98 options in IBM PC emulation mode? */
+        mainMenu.get_item("VideoPC98Menu").hide(!IS_PC98_ARCH).refresh_item(mainMenu);
 
 #if !defined(C_EMSCRIPTEN)
         mainMenu.get_item("show_console").check(showconsole_init).refresh_item(mainMenu);
@@ -9949,7 +10176,8 @@ fresh_boot:
         wait_debugger = false;
         reboot_machine = false;
         dos_kernel_shutdown = false;
-        guest_msdos_mcb_chain = (uint16_t)(~0u);
+	guest_msdos_mcb_chain = (uint16_t)(~0u);
+	guest_msdos_dev_chain = (uint16_t)(~0u);
 
 #if C_DEBUG
         if (control->opt_test) ::testing::InitGoogleTest(&argc, argv);
@@ -10100,11 +10328,13 @@ fresh_boot:
             else
                 DispatchVMEvent(VM_EVENT_DOS_EXIT_BEGIN);
 
+#if !defined(OSFREE)
             /* older shutdown code */
             RemoveEMSPageFrame();
 
             /* remove UMB block */
             if (!keep_umb_on_boot) RemoveUMBBlock();
+#endif
 
             /* disable INT 33h mouse services. it can interfere with guest OS paging and control of the mouse */
             DisableINT33();
@@ -10142,8 +10372,10 @@ fresh_boot:
             DOS_UninstallMisc();
             SBLASTER_DOS_Shutdown();
             GUS_DOS_Shutdown();
+#if !defined(OSFREE)
             /* disable Expanded Memory. EMM is a DOS API, not a BIOS API */
             EMS_DoShutDown();
+#endif
             /* and XMS, also a DOS API */
             XMS_DoShutDown();
             /* and the DOS API in general */
@@ -10158,7 +10390,7 @@ fresh_boot:
             dos_kernel_disabled = true;
 
             std::string core(static_cast<Section_prop *>(control->GetSection("cpu"))->Get_string("core"));
-            if (!strcmp(RunningProgram, "LOADLIN") && core == "auto") {
+            if (RunningProgram == "LOADLIN" && core == "auto") {
                 cpudecoder=&CPU_Core_Normal_Run;
                 mainMenu.get_item("mapper_normal").check(true).refresh_item(mainMenu);
 #if (C_DYNAMIC_X86) || (C_DYNREC)
@@ -10175,6 +10407,11 @@ fresh_boot:
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU
             Reflect_Menu();
 #endif
+
+            /* proceed to real mode */
+            void CPU_Snap_Back_Forget();
+            CPU_Snap_Back_To_Real_Mode();
+            CPU_Snap_Back_Forget();
         }
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU
@@ -10196,14 +10433,29 @@ fresh_boot:
             /* if instructed, turn off A20 at boot */
             if (disable_a20) MEM_A20_Enable(false);
 
+            /* Why allow the Help -> DOS commands menu when running a guest OS? */
+            mainMenu.get_item("HelpCommandMenu").enable(false).refresh_item(mainMenu);
+
             /* PC-98: hide the cursor */
             if (IS_PC98_ARCH) {
                 void PC98_show_cursor(bool show);
                 PC98_show_cursor(false);
             }
 
+            /* if BOOT gave us code to load, do it -- I hope you set boot_code_image_load_to to a nonzero value! */
+            if (!boot_code_image.empty()) {
+                LOG_MSG("Loading %u bytes of boot code to %x",(unsigned int)boot_code_image.size(),(unsigned int)boot_code_image_load_to);
+                MEM_BlockWrite(boot_code_image_load_to,boot_code_image.data(),boot_code_image.size());
+                boot_code_image_load_to = 0;
+                boot_code_image.clear();
+            }
+
             /* new code: fire event */
             DispatchVMEvent(VM_EVENT_GUEST_OS_BOOT);
+
+            /* just to be sure nothing during DOS kernel shutdown changed the stack pointer */
+            SegSet16(ss,boot_code_image_stack_ss);
+            reg_esp = boot_code_image_stack_sp;
 
             LOG_MSG("Alright: DOS kernel shutdown, booting a guest OS\n");
             LOG_MSG("  CS:IP=%04x:%04x SS:SP=%04x:%04x AX=%04x BX=%04x CX=%04x DX=%04x\n",
@@ -10234,6 +10486,7 @@ fresh_boot:
             boothax = BOOTHAX_NONE;
             guest_msdos_LoL = 0;
             guest_msdos_mcb_chain = 0;
+            guest_msdos_dev_chain = 0;
 
             void CPU_Snap_Back_Forget();
             /* Shutdown everything. For shutdown to work properly we must force CPU to real mode */
@@ -10279,8 +10532,9 @@ fresh_boot:
             boothax = BOOTHAX_NONE;
             guest_msdos_LoL = 0;
             guest_msdos_mcb_chain = 0;
+            guest_msdos_dev_chain = 0;
 
-            void CPU_Snap_Back_Forget();
+	    void CPU_Snap_Back_Forget();
             /* Shutdown everything. For shutdown to work properly we must force CPU to real mode */
             CPU_Snap_Back_To_Real_Mode();
             CPU_Snap_Back_Forget();
@@ -10419,6 +10673,11 @@ fresh_boot:
 	}
 #endif
 
+#if defined(C_DOSBOX_AGENT)
+        agent_server.Stop();
+        dosbox_agent::AGENT_BridgeShutdown();
+#endif
+
         LOG::Exit();
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU && defined(WIN32) && !defined(HX_DOS) && (!defined(C_SDL2) && defined(SDL_DOSBOX_X_SPECIAL) || defined(C_SDL2))
@@ -10512,8 +10771,14 @@ bool TTF_using(void) {
 }
 
 bool Get_Custom_SaveDir(std::string& savedir) {
-    if (custom_savedir.length() != 0) {
-        savedir=custom_savedir;
+    if(custom_savedir.length() != 0) {
+        if(Cross::IsPathAbsolute(custom_savedir)) {
+            savedir = custom_savedir; // use the absolute path as is
+        }
+        else {
+            savedir = working_dir + CROSS_FILESPLIT + custom_savedir;
+        }
+        LOG(LOG_MISC, LOG_DEBUG)("savestate: Set custom save directory to: %s", savedir.c_str());
         return true;
     }
     return false;

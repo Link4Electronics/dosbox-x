@@ -18,11 +18,15 @@
 
 
 #include "dosbox.h"
+#if defined(C_DOSBOX_AGENT)
+#include "agent/agent_bridge.h"
+#endif
 #if C_DEBUG
 
 #include "../../tests/tests.h"
 
 #include <string.h>
+#include <atomic>
 #include <list>
 #include <vector>
 #include <ctype.h>
@@ -33,6 +37,7 @@
 using namespace std;
 
 #include "debug.h"
+#include "agent/agent_bridge.h"
 #include "cross.h" //snprintf
 #include "fpu.h"
 #include "bios.h"
@@ -54,6 +59,11 @@ using namespace std;
 bool Clear_SYSENTER_Debug();
 bool Toggle_BreakSYSEnter();
 bool Toggle_BreakSYSExit();
+
+#if !defined(OSFREE)
+extern bool debugger_break_on_exec;
+extern unsigned int debugger_box_depth;
+#endif
 
 /* [https://github.com/joncampbell123/dosbox-x/issues/1264] ncurses non-ASCII keys are outside ASCII range (start at octal 0400 == hex 0x100) */
 static inline int ncurses_aware_toupper(int x) {
@@ -149,6 +159,7 @@ extern bool logBuffSuppressConsole;
 extern bool logBuffSuppressConsoleNeedUpdate;
 
 void DEBUG_PrintGUS();
+void DEBUG_PrintRTC();
 
 // Forwards
 static void DrawCode(void);
@@ -156,12 +167,15 @@ static void DrawInput(void);
 static void DEBUG_RaiseTimerIrq(void);
 static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num);
 static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num);
+static void LogDEVS(void);
 static void LogMCBS(void);
 static void LogGDT(void);
 static void LogLDT(void);
 static void LogIDT(void);
 static void LogXMS(void);
+#if !defined(OSFREE)
 static void LogEMS(void);
+#endif
 static void LogFNKEY(void);
 static void LogPages(char* selname);
 static void LogCPUInfo(void);
@@ -201,6 +215,8 @@ static void LogEMUMachine(void) {
         switch (machine) {
             case MCH_HERC:      m="Hercules";   break;
             case MCH_CGA:       m="CGA";        break;
+            case MCH_OLIVETTI:  m="Olivetti M24"; break;
+            case MCH_3270PC:    m="IBM 3270 PC"; break;
             case MCH_TANDY:     m="Tandy";      break;
             case MCH_PCJR:      m="PCjr";       break;
             case MCH_EGA:       m="EGA";        break;
@@ -289,6 +305,7 @@ typedef struct MEMFinder {
 	uint16_t iterations = 0;
 	uint16_t seg = 0;
 	uint32_t ofs = 0;
+	uint32_t baseLinear = 0;
 	uint32_t range = 0;
 	uint32_t value = 0;
 	uint32_t matches = 0;
@@ -329,6 +346,7 @@ extern Bitu cycle_count;
 static bool debugging = false;
 static bool debug_running = false;
 static bool check_rescroll = false;
+static std::atomic<uint64_t> agent_entry_breakpoint_sequence(0);
 
 static FPU_rec oldfpu;
 static bool warn_dynamic = false;
@@ -437,12 +455,37 @@ uint64_t LinMakeProt(uint16_t selector, uint32_t offset)
 	return mem_no_address;
 }
 
+static bool Is16BitSegment(const uint16_t seg)
+{
+	if (cpu.pmode && !(reg_flags & FLAG_VM)) {
+		if (seg == SegValue(cs))
+			return !cpu.code.big;
+
+		Descriptor desc;
+		return cpu.gdt.GetDescriptor(seg, desc) ? !desc.saved.seg.big : false;
+	}
+
+	return true;
+}
+
 uint64_t GetAddress(uint16_t seg, uint32_t offset)
 {
+	/* In 16-bit modes, segment offsets wrap to 16 bits. This also normalizes
+	 * values that came from signed arithmetic (for example, -1 -> 0xFFFF). */
+	if (Is16BitSegment(seg))
+		offset &= 0xffffu;
+
+	/* For the current CS, always use the cached hidden base (SegPhys(cs)).
+	 * Real x86 segment registers have a hidden descriptor cache that is only
+	 * updated when a new selector is loaded. After LMSW sets CR0.PE=1 but
+	 * before a far jump reloads CS, cpu.pmode is true yet SegValue(cs) still
+	 * holds the previous (real-mode) value, so resolving via the GDT would
+	 * read garbage. */
+	if (seg == SegValue(cs)) return SegPhys(cs)+(uint64_t)offset;
+
 	if (cpu.pmode && !(reg_flags & FLAG_VM))
 		return LinMakeProt(seg,offset);
 
-	if (seg==SegValue(cs)) return SegPhys(cs)+(uint64_t)offset;
 	return ((uint64_t)seg<<4u)+offset;
 }
 
@@ -524,6 +567,7 @@ private:
 public:
 	static void       InsertVariable(char* name, PhysPt adr);
 	static CDebugVar* FindVar       (PhysPt pt);
+	static CDebugVar* FindVar       (const std::string& name);
 	static void       DeleteAll     ();
 	static bool       SaveVars      (char* name);
 	static bool       LoadVars      (char* name);
@@ -532,6 +576,45 @@ public:
 };
 
 std::vector<CDebugVar*> CDebugVar::varList;
+
+static void AnnotateDirectBranch(char* line, const size_t line_size)
+{
+	char* mnemonic = line;
+	while (*mnemonic == ' ' || *mnemonic == '\t') ++mnemonic;
+
+	char* operand = mnemonic;
+	while (isalpha(static_cast<unsigned char>(*operand))) ++operand;
+	const std::string instruction(mnemonic, operand - mnemonic);
+	if (instruction != "call" && instruction != "jmp" &&
+	    (instruction.empty() || instruction[0] != 'j') &&
+	    instruction.compare(0, 4, "loop") != 0)
+		return;
+
+	while (*operand == ' ' || *operand == '\t') ++operand;
+	for (const char* qualifier : {"far ", "near ", "short "}) {
+		const size_t length = strlen(qualifier);
+		if (strncmp(operand, qualifier, length) == 0) {
+			operand += length;
+			break;
+		}
+	}
+
+	char* end = operand;
+	while (isxdigit(static_cast<unsigned char>(*end))) ++end;
+	if (end == operand || (*end != '\0' && *end != ' ' && *end != '\t')) return;
+
+	char* parse_end = nullptr;
+	const unsigned long target = strtoul(operand, &parse_end, 16);
+	if (parse_end != end || target > UINT32_MAX) return;
+
+	CDebugVar* variable = CDebugVar::FindVar(static_cast<PhysPt>(target));
+	if (!variable) return;
+
+	const size_t used = strlen(line);
+	const size_t available = used < line_size ? line_size - used : 0;
+	if (available > 1)
+		snprintf(line + used, available, " <%s>", variable->GetName());
+}
 
 
 /********************/
@@ -583,9 +666,11 @@ public:
 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
+	static bool				DeleteBreakpoint		(CBreakpoint* breakpoint);
 	static bool				DeleteByIndex		(uint16_t index);
 	static void				DeleteAll			(void);
 	static void				ShowList			(void);
+	static CBreakpoint*				ConsumeLastTriggered			(void);
 
 
 private:
@@ -606,6 +691,7 @@ private:
 	bool		once;
 
 	static std::list<CBreakpoint*>	BPoints;
+	static CBreakpoint*	lastTriggered;
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
 #endif
@@ -659,6 +745,7 @@ void CBreakpoint::Activate(bool _active)
 
 // Statics
 std::list<CBreakpoint*> CBreakpoint::BPoints;
+CBreakpoint* CBreakpoint::lastTriggered = nullptr;
 
 CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
@@ -730,6 +817,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
 			// Found
+			lastTriggered = bp;
 			if (bp->GetOnce()) {
 				// delete it, if it should only be used once
 				(BPoints.erase)(i);
@@ -773,6 +861,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
 					bp->SetValue(value);
+					lastTriggered = bp;
 					return true;
 				}
 			}
@@ -820,6 +909,7 @@ void CBreakpoint::DeleteAll()
 		delete bp;
 	}
 	(BPoints.clear)();
+	lastTriggered = nullptr;
 }
 
 
@@ -888,13 +978,31 @@ bool CBreakpoint::IsBreakpoint(uint16_t seg, uint32_t off)
 bool CBreakpoint::DeleteBreakpoint(uint16_t seg, uint32_t off)
 {
 	CBreakpoint* bp = FindPhysBreakpoint(seg, off, false);
-	if (bp) {
-		BPoints.remove(bp);
-		delete bp;
+	return DeleteBreakpoint(bp);
+}
+
+bool CBreakpoint::DeleteBreakpoint(CBreakpoint* breakpoint)
+{
+	if (breakpoint == nullptr)
+		return false;
+	for (std::list<CBreakpoint*>::iterator it = BPoints.begin(); it != BPoints.end(); ++it) {
+		if (*it != breakpoint)
+			continue;
+		BPoints.erase(it);
+		breakpoint->Activate(false);
+		if (lastTriggered == breakpoint)
+			lastTriggered = nullptr;
+		delete breakpoint;
 		return true;
 	}
-
 	return false;
+}
+
+CBreakpoint* CBreakpoint::ConsumeLastTriggered(void)
+{
+	CBreakpoint* result = lastTriggered;
+	lastTriggered = nullptr;
+	return result;
 }
 
 
@@ -971,6 +1079,144 @@ static bool StepOver()
 	} 
 	return false;
 }
+
+void DrawRegistersUpdateOld(void);
+int32_t DEBUG_Run(int32_t amount,bool quickexit);
+bool ParseCommand(char* str);
+
+bool DEBUG_AgentStep(bool over, bool* continued)
+{
+	if (continued == nullptr || !debugging || debug_running)
+		return false;
+
+	DEBUG_AgentClearLastBreakpoint();
+	DrawRegistersUpdateOld();
+	if (over && StepOver()) {
+		mustCompleteInstruction = true;
+		inhibit_int_breakpoint = true;
+		DEBUG_Run(1,false);
+		inhibit_int_breakpoint = false;
+		mustCompleteInstruction = false;
+		*continued = true;
+		return true;
+	}
+
+	exitLoop = false;
+	mustCompleteInstruction = true;
+	DEBUG_Run(1,true);
+	mustCompleteInstruction = false;
+	*continued = false;
+	return true;
+}
+
+bool DEBUG_AgentResumeAfterTerminate(void)
+{
+	if (!debugging || debug_running)
+		return true;
+
+	// ParseCommand("RUN") always executes one instruction before returning to
+	// the normal loop. TerminateTarget has already restored CS:IP to the
+	// callback stop trampoline that must be observed by the enclosing
+	// CALLBACK_RunRealInt invocation. Stepping here consumes that trampoline
+	// inside the debugger and strands the synchronous DEBUGBOX command frame.
+	DrawRegistersUpdateOld();
+	debug_running = false;
+	debugging = false;
+	DrawCode();
+	DrawInput();
+	logBuffSuppressConsole = false;
+	if (logBuffSuppressConsoleNeedUpdate) {
+		logBuffSuppressConsoleNeedUpdate = false;
+		DEBUG_RefreshPage(0);
+	}
+	CBreakpoint::ActivateBreakpoints();
+	mainMenu.get_item("debugger_rundebug").check(false).refresh_item(mainMenu);
+	mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
+	mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
+	DOSBOX_SetNormalLoop();
+	GFX_SetTitle(-1,-1,-1,is_paused);
+	return true;
+}
+
+bool DEBUG_AgentCanStartTarget(void)
+{
+#if !defined(OSFREE)
+    return !debugging && !debug_running && !debugger_break_on_exec && debugger_box_depth == 0;
+#else
+	return false;
+#endif
+}
+
+uint64_t DEBUG_AgentEntryBreakpointSequence(void)
+{
+	return agent_entry_breakpoint_sequence.load(std::memory_order_relaxed);
+}
+
+bool DEBUG_AgentCreateExecutionBreakpoint(uint16_t seg, uint32_t off, bool once, uintptr_t* handle)
+{
+	if (handle == nullptr || GetAddress(seg,off) == mem_no_address)
+		return false;
+	CBreakpoint* breakpoint = CBreakpoint::AddBreakpoint(seg,off,once);
+	*handle = reinterpret_cast<uintptr_t>(breakpoint);
+	return breakpoint != nullptr;
+}
+
+bool DEBUG_AgentCreateMemoryBreakpoint(uint16_t seg,
+                                       uint32_t off,
+                                       bool protected_mode,
+                                       bool linear,
+                                       uintptr_t* handle)
+{
+#if C_HEAVY_DEBUG
+	if (handle == nullptr || (protected_mode && linear))
+		return false;
+	const uint64_t address = linear ? static_cast<uint64_t>(off) : GetAddress(seg,off);
+	if (address == mem_no_address)
+		return false;
+	uint8_t value = 0;
+	if (mem_readb_checked(static_cast<PhysPt>(address), &value))
+		return false;
+	CBreakpoint* breakpoint = CBreakpoint::AddMemBreakpoint(seg,off);
+	if (breakpoint == nullptr)
+		return false;
+	if (protected_mode)
+		breakpoint->SetType(BKPNT_MEMORY_PROT);
+	else if (linear)
+		breakpoint->SetType(BKPNT_MEMORY_LINEAR);
+	breakpoint->SetValue(value);
+	*handle = reinterpret_cast<uintptr_t>(breakpoint);
+	return true;
+#else
+	(void)seg;
+	(void)off;
+	(void)protected_mode;
+	(void)linear;
+	(void)handle;
+	return false;
+#endif
+}
+
+bool DEBUG_AgentDeleteBreakpoint(uintptr_t handle)
+{
+	return CBreakpoint::DeleteBreakpoint(reinterpret_cast<CBreakpoint*>(handle));
+}
+
+uintptr_t DEBUG_AgentConsumeLastBreakpoint(void)
+{
+	return reinterpret_cast<uintptr_t>(CBreakpoint::ConsumeLastTriggered());
+}
+
+void DEBUG_AgentClearLastBreakpoint(void)
+{
+	(void)CBreakpoint::ConsumeLastTriggered();
+}
+
+#if C_HEAVY_DEBUG
+bool DEBUG_AgentStartTrace(uint32_t instruction_count);
+bool DEBUG_AgentStopTrace(uint32_t* event_count);
+bool DEBUG_AgentTraceIsActive(void);
+void DEBUG_AgentCopyTraceEvents(std::vector<DEBUG_AgentTraceEvent>* events);
+#endif
 
 bool DEBUG_ExitLoop(void)
 {
@@ -1352,6 +1598,7 @@ static void DrawCode(void) {
             drawsize=size=1;
             dline[0]=0;
         }
+		AnnotateDirectBranch(dline, sizeof(dline));
 		mvwprintw(dbg.win_code,i,0,"%04X:%08X ",codeViewData.useCS,disEIP);
 
 		if (drawsize>10) { toolarge = true; drawsize = 9; }
@@ -1626,6 +1873,7 @@ uint32_t GetHexValue(char* const str, char* &hex,bool *parsed,int exprge)
             else if (something == "DTASEG") { regval = (!dos_kernel_disabled) ? (dos.dta() >> 16u)    : 0; }
             else if (something == "DTAOFF") { regval = (!dos_kernel_disabled) ? (dos.dta() & 0xFFFFu) : 0; }
             else if (something == "PSPSEG") { regval = (!dos_kernel_disabled) ?  dos.psp()            : 0; }
+            else if (CDebugVar* variable = CDebugVar::FindVar(something)) { regval = variable->GetAdr(); }
             else if (hexnumber) { regval = (uint32_t)strtoul(something.c_str(),NULL,16/*hexadecimal*/); }
             else { if (parsed) *parsed = 0; return 0; }
         }
@@ -2018,7 +2266,7 @@ bool ParseCommand(char* str) {
 			if (MEMFINDInstance != NULL){
 				DEBUG_BeginPagedContent();
 				uint32_t j = 0;
-				for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i+=MEMFINDInstance->size){
+				for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
 							switch (MEMFINDInstance->size){
 								case 1:
 									mem_readb_checked((PhysPt)(i),&valfind8);
@@ -2039,7 +2287,7 @@ bool ParseCommand(char* str) {
 							}
 							if (MEMFINDInstance->tableTruth[j] == true){
 								listedvalues++;
-								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %04X:%06X Current Value: %08X\n",MEMFINDInstance->seg,(i - (MEMFINDInstance->seg * 16)),valfind);
+								DEBUG_ShowMsg("DEBUG: [MEMFIND] Address: %04X:%06X (lin %08X) Current Value: %0*X\n",MEMFINDInstance->seg,(MEMFINDInstance->ofs + (i - MEMFINDInstance->baseLinear)),i,MEMFINDInstance->size*2,valfind);
 							}
 							j+=MEMFINDInstance->size;
 						}
@@ -2054,12 +2302,19 @@ bool ParseCommand(char* str) {
 		uint32_t ofs = GetHexValue(found,found); found++;
 		uint32_t num = GetHexValue(found,found); found++;
 		if ((MEMFINDInstance == NULL) && (num > 0)){
-			if (((seg*16)+ofs+num) > 16777215){
-				DEBUG_ShowMsg("DEBUG: Address range larger than valid size, cancelling.");
+			uint64_t base = GetAddress(seg,ofs);
+			if (base == mem_no_address){
+				DEBUG_ShowMsg("DEBUG: Invalid selector/segment, cancelling.");
+				return true;
+			}
+			uint64_t memBytes = (uint64_t)MEM_TotalPages() << 12;
+			if ((base + (uint64_t)num) > memBytes){
+				DEBUG_ShowMsg("DEBUG: Range exceeds configured memory (%lX bytes), cancelling.",(unsigned long)memBytes);
 				return true;
 			}
 			DEBUG_ShowMsg("DEBUG: Created memory search instance.");
 			MEMFINDInstance = new MEMFinder;
+			MEMFINDInstance->baseLinear = (uint32_t)base;
 		} else if ((MEMFINDInstance == NULL) && (num == 0)){
 			DEBUG_ShowMsg("DEBUG: --MEMFIND-- Start memory search instance.");
 			DEBUG_ShowMsg("DEBUG: Use MEMS to proceed through search instance.");
@@ -2089,12 +2344,12 @@ bool ParseCommand(char* str) {
 				MEMFINDInstance->size = 1;
 				break;
 		}
-		DEBUG_ShowMsg("DEBUG: RAM search from %04X:%04X with range: %06X\n",seg,ofs,num);
+		DEBUG_ShowMsg("DEBUG: RAM search from %04X:%04X (lin %08X) with range: %06X\n",seg,ofs,MEMFINDInstance->baseLinear,num);
 		MEMFINDInstance->range = num;
 		MEMFINDInstance->ofs = ofs;
 		MEMFINDInstance->seg = seg;
 		MEMFINDInstance->tableTruth.resize(num,true);
-		for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i++){
+		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i++){
 			mem_readb_checked((PhysPt)(i),&valfind8);
 			MEMFINDInstance->tableValue.push_back(valfind8);
 		}
@@ -2171,7 +2426,7 @@ bool ParseCommand(char* str) {
 			MEMFINDInstance->usePreviousValue = false;
 		}
 		uint32_t y = 0;	//This index is seperated from the for loop, as the for loop can start from any index while this particular index starts at 0
-		for (uint32_t i = (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16)); i < (MEMFINDInstance->ofs + (MEMFINDInstance->seg * 16) + MEMFINDInstance->range); i+=MEMFINDInstance->size){
+		for (uint32_t i = MEMFINDInstance->baseLinear; i < MEMFINDInstance->baseLinear + MEMFINDInstance->range; i+=MEMFINDInstance->size){
 			switch (MEMFINDInstance->size){
 				case 1:
 					mem_readb_checked((PhysPt)(i),&valfind8);
@@ -2254,7 +2509,7 @@ bool ParseCommand(char* str) {
 			if (MEMFINDInstance->usePreviousValue == true){
 				DEBUG_ShowMsg("DEBUG: No more matches found when comparing %s previous value. Memory search instance finished.\n",opTypeStr);
 			} else {
-				DEBUG_ShowMsg("DEBUG: No more matches found with value %s (%06X). Memory search instance finished.\n",opTypeStr,value);
+				DEBUG_ShowMsg("DEBUG: No more matches found with value %s (%0*X). Memory search instance finished.\n",opTypeStr,MEMFINDInstance->size*2,value);
 			}
 			MEMFINDInstance->tableTruth.clear();
 			MEMFINDInstance->tableValue.clear();
@@ -2266,7 +2521,7 @@ bool ParseCommand(char* str) {
 				if (MEMFINDInstance->usePreviousValue == true){
 					DEBUG_ShowMsg("DEBUG: (%06X) addresses matching %s their previous values. Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,MEMFINDInstance->iterations);
 				} else {
-					DEBUG_ShowMsg("DEBUG: (%06X) matches found with value %s (%06X). Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,value,MEMFINDInstance->iterations);
+					DEBUG_ShowMsg("DEBUG: (%06X) matches found with value %s (%0*X). Iterations: %06X\n",MEMFINDInstance->matches,opTypeStr,MEMFINDInstance->size*2,value,MEMFINDInstance->iterations);
 				}
 		}
 		return true;
@@ -2832,11 +3087,14 @@ bool ParseCommand(char* str) {
 	if (command == "DOS") {
 		stream >> command;
 		if (command == "MCBS") LogMCBS();
-        else if (command == "KERN") LogDOSKernMem();
-        else if (command == "XMS") LogXMS();
-        else if (command == "EMS") LogEMS();
-        else if (command == "FNKEY") LogFNKEY();
-        else return false;
+		else if (command == "DEVS") LogDEVS();
+		else if (command == "KERN") LogDOSKernMem();
+		else if (command == "XMS") LogXMS();
+#if !defined(OSFREE)
+		else if (command == "EMS") LogEMS();
+#endif
+		else if (command == "FNKEY") LogFNKEY();
+		else return false;
 
 		return true;
 	}
@@ -3213,8 +3471,22 @@ bool ParseCommand(char* str) {
         return true;
     }
 
+    if (command == "RTC") {
+        while (*found == ' ') found++;
+        command.clear(); // iostream >> command does not update "command" if there is no string there, so it's basically fancy scanf() then!
+        stream >> command;
+        while (*found != 0 && *found != ' ') found++;
+        while (*found == ' ') found++;
+
+        if (command == "") {
+            DEBUG_PrintRTC();
+            return true;
+        }
+    }
+
     if (command == "VGA") {
         while (*found == ' ') found++;
+        command.clear(); // iostream >> command does not update "command" if there is no string there, so it's basically fancy scanf() then!
         stream >> command;
         while (*found != 0 && *found != ' ') found++;
         while (*found == ' ') found++;
@@ -4084,30 +4356,53 @@ char* AnalyzeInstruction(char* inst, bool saveSelector) {
 			} else
 				pos++;
 		}
-		uint32_t address = (uint32_t)GetAddress(seg,adr);
-		if (!(get_tlb_readhandler(address)->flags & PFLAG_INIT)) {
-			static char outmask[] = "%s:[%04X]=%02X";
-
-			if (cpu.pmode) outmask[6] = '8';
-				switch (DasmLastOperandSize()) {
-				case 8 : {	uint8_t val = mem_readb(address);
-							outmask[12] = '2';
-							sprintf(result,outmask,prefix,adr,val);
-						}	break;
-				case 16: {	uint16_t val = mem_readw(address);
-							outmask[12] = '4';
-							sprintf(result,outmask,prefix,adr,val);
-						}	break;
-				case 32: {	uint32_t val = mem_readd(address);
-							outmask[12] = '8';
-							sprintf(result,outmask,prefix,adr,val);
-						}	break;
-			}
-		} else {
+		if (Is16BitSegment(seg))
+			adr &= 0xffffu;
+		const uint64_t address64 = GetAddress(seg,adr);
+		const uint32_t address = (uint32_t)address64;
+		if (address64 == mem_no_address) {
 			sprintf(result,"[illegal]");
 		}
+		else {
+			static char outmask[] = "%s:[%04X]=%02X";
+			bool illegal = false;
+
+			if (cpu.pmode) outmask[6] = '8';
+			switch (DasmLastOperandSize()) {
+			case 8: {
+				uint8_t val = 0;
+				illegal = mem_readb_checked(address,&val);
+				if (!illegal) {
+					outmask[12] = '2';
+					sprintf(result,outmask,prefix,adr,val);
+				}
+			} break;
+			case 16: {
+				uint16_t val = 0;
+				illegal = mem_readw_checked(address,&val);
+				if (!illegal) {
+					outmask[12] = '4';
+					sprintf(result,outmask,prefix,adr,val);
+				}
+			} break;
+			case 32: {
+				uint32_t val = 0;
+				illegal = mem_readd_checked(address,&val);
+				if (!illegal) {
+					outmask[12] = '8';
+					sprintf(result,outmask,prefix,adr,val);
+				}
+			} break;
+			default:
+				illegal = true;
+				break;
+			}
+
+			if (illegal)
+				sprintf(result,"[illegal]");
+		}
 		// Variable found ?
-		CDebugVar* var = CDebugVar::FindVar(address);
+		CDebugVar* var = (address64 != mem_no_address) ? CDebugVar::FindVar(address) : NULL;
 		if (var) {
 			// Replace occurrence
 			char* pos1 = strchr(inst,'[');
@@ -4303,11 +4598,96 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
 	return ret;
 }
 
+#ifdef WIN32
+/* Translate VT escape sequences into ncurses KEY_* constants. Needed because
+   we set ENABLE_VIRTUAL_TERMINAL_INPUT on the debugger console input handle
+   (so the terminal host stops swallowing F11 etc. for fullscreen). With that
+   flag, function keys arrive as VT sequences (e.g. F11 = ESC [ 23 ~) instead of
+   virtual key codes, so ncurses' getch() returns them char by char and the
+   KEY_F(N) cases below never fire. */
+static int dbg_getch_vt(void) {
+	int c = getch();
+	if (c != 27) return c;
+
+	int c2 = getch();
+	if (c2 < 0) return 27; /* plain ESC */
+
+	if (c2 == 'O') {
+		/* SS3: ESC O X */
+		int c3 = getch();
+		switch (c3) {
+			case 'P': return KEY_F(1);
+			case 'Q': return KEY_F(2);
+			case 'R': return KEY_F(3);
+			case 'S': return KEY_F(4);
+			case 'A': return KEY_UP;
+			case 'B': return KEY_DOWN;
+			case 'C': return KEY_RIGHT;
+			case 'D': return KEY_LEFT;
+			case 'H': return KEY_HOME;
+			case 'F': return KEY_END;
+		}
+		return 27;
+	}
+
+	if (c2 == '[') {
+		/* CSI: ESC [ [params] final */
+		int param = 0;
+		int c3 = getch();
+		while (c3 >= '0' && c3 <= '9') {
+			param = param * 10 + (c3 - '0');
+			c3 = getch();
+		}
+		if (c3 == '~') {
+			switch (param) {
+				case 1: return KEY_HOME;
+				case 2: return KEY_IC;
+				case 3: return KEY_DC;
+				case 4: return KEY_END;
+				case 5: return KEY_PPAGE;
+				case 6: return KEY_NPAGE;
+				case 11: return KEY_F(1);
+				case 12: return KEY_F(2);
+				case 13: return KEY_F(3);
+				case 14: return KEY_F(4);
+				case 15: return KEY_F(5);
+				case 17: return KEY_F(6);
+				case 18: return KEY_F(7);
+				case 19: return KEY_F(8);
+				case 20: return KEY_F(9);
+				case 21: return KEY_F(10);
+				case 23: return KEY_F(11);
+				case 24: return KEY_F(12);
+			}
+		} else if (param == 0) {
+			switch (c3) {
+				case 'A': return KEY_UP;
+				case 'B': return KEY_DOWN;
+				case 'C': return KEY_RIGHT;
+				case 'D': return KEY_LEFT;
+				case 'H': return KEY_HOME;
+				case 'F': return KEY_END;
+			}
+		}
+		return 27;
+	}
+
+	/* Alt+letter or other ESC-prefixed sequence — push back so the existing
+	   case 27 handler below can read it as before. */
+	ungetch(c2);
+	return 27;
+}
+#endif
+
 uint32_t DEBUG_CheckKeys(void) {
 	Bits ret=0;
 	bool numberrun = false;
 	bool skipDraw = false;
+#ifdef WIN32
+	int key=dbg_getch_vt();
+#else
 	int key=getch();
+#endif
 
     if (key == KEY_RESIZE) {
 #ifdef WIN32 /* BUG: pdcurses notifies us immediately upon getting a resize event but does not update it's
@@ -4747,6 +5127,7 @@ void dyn_core_dh_debug_flush (void);
 #endif
 
 Bitu DEBUG_Loop(void) {
+    dosbox_agent::AGENT_BridgePump();
     if (debug_running) {
         Bitu now = SDL_GetTicks();
 
@@ -4933,6 +5314,9 @@ void DEBUG_Enable_Handler(bool pressed) {
 	//KEYBOARD_ClrBuffer();
     GFX_SetTitle(-1,-1,-1,false);
     runnormal = false;
+#if defined(C_DOSBOX_AGENT)
+    dosbox_agent::AGENT_NotifyDebuggerStopped(SegValue(cs), reg_eip);
+#endif
     if (debugrunmode==1) {char command[] = "RUN"; ParseCommand(command);}
     else if (debugrunmode==2) {char command[] = "RUNWATCH"; ParseCommand(command);}
 }
@@ -4949,23 +5333,43 @@ static void DEBUG_RaiseTimerIrq(void) {
 	PIC_ActivateIRQ(0);
 }
 
+static void LogDEVChain(uint32_t devhdr) {
+	DOS_DEVHDR::hdr hdr;
+	char tmp[9];
+
+	while (1) {
+		MEM_BlockRead(PhysMake(devhdr >> 16,devhdr & 0xFFFFu),&hdr,sizeof(hdr));
+		memcpy(tmp,hdr.name,8); tmp[8] = 0;
+		DEBUG_ShowMsg("%04X:%04X %04X  %04X  %04X  %s",
+			devhdr >> 16,devhdr & 0xFFFFu,
+			hdr.attributes,hdr.strategy_entry,hdr.interrupt_entry,tmp);
+
+		devhdr = hdr.nextdev;
+		if (devhdr == NONEXTDEV) break;
+
+		/* Apparently in MS-DOS 5, a driver can set only the offset field to 0xFFFF and that is sufficient to end the linked list */
+		if ((devhdr&0xFFFFu) == 0xFFFFu) break;
+	}
+}
+
 // Display the content of the MCB chain starting with the MCB at the specified segment.
 static void LogMCBChain(uint16_t mcb_segment) {
-	DOS_MCB mcb(mcb_segment);
-	char filename[9]; // 8 characters plus a terminating NUL
+	std::string filename;
 	const char *psp_seg_note;
 	uint16_t DOS_dataOfs = static_cast<uint16_t>(dataOfs); //Realmode addressing only
 	PhysPt dataAddr = PhysMake(dataSeg,DOS_dataOfs);// location being viewed in the "Data Overview"
+	uint16_t end_of_chain_segment = mcb_segment;
 
-	// loop forever, breaking out of the loop once we've processed the last MCB
-	while (true) {
+	for (const auto mcb : DOS_MCB(mcb_segment)) {
+		const auto current_segment = mcb.GetSeg();
+
 		// verify that the type field is valid
-		if (mcb.GetType()!=0x4d && mcb.GetType()!=0x5a) {
-			DEBUG_ShowMsg("MCB chain broken at %04X:0000!",mcb_segment);
+		if (!mcb.isValid()) {
+			DEBUG_ShowMsg("MCB chain broken at %04X:0000!",current_segment);
 			return;
 		}
 
-		mcb.GetFileName(filename);
+		filename = mcb.GetFileName();
 
 		// some PSP segment values have special meanings
 		switch (mcb.GetPSPSeg()) {
@@ -4979,25 +5383,18 @@ static void LogMCBChain(uint16_t mcb_segment) {
 				psp_seg_note = "";
 		}
 
-		DEBUG_ShowMsg("   %04X  %12u     %04X %-7s  %s",mcb_segment,mcb.GetSize() << 4,mcb.GetPSPSeg(), psp_seg_note, filename);
+		DEBUG_ShowMsg("   %04X  %12u     %04X %-7s  %s",current_segment,mcb.GetSize() << 4,mcb.GetPSPSeg(), psp_seg_note, filename.c_str());
 
 		// print a message if dataAddr is within this MCB's memory range
-		PhysPt mcbStartAddr = PhysMake(mcb_segment+1,0);
-		PhysPt mcbEndAddr = PhysMake(mcb_segment+1+mcb.GetSize(),0);
+		PhysPt mcbStartAddr = PhysMake(current_segment+1,0);
+		PhysPt mcbEndAddr = PhysMake(current_segment+1+mcb.GetSize(),0);
 		if (dataAddr >= mcbStartAddr && dataAddr < mcbEndAddr) {
 			DEBUG_ShowMsg("   (data addr %04hX:%04X is %u bytes past this MCB)",dataSeg,DOS_dataOfs,dataAddr - mcbStartAddr);
 		}
-
-		// if we've just processed the last MCB in the chain, break out of the loop
-		mcb_segment+=mcb.GetSize()+1;
-		if (mcb.GetType()==0x5a)
-			break;
-
-		// else, move to the next MCB in the chain
-		mcb.SetPt(mcb_segment);
+		end_of_chain_segment = static_cast<uint16_t>(current_segment + mcb.GetSize() + 1);
 	}
 
-	DEBUG_ShowMsg("   %04X  END OF CHAIN",mcb_segment);
+	DEBUG_ShowMsg("   %04X  END OF CHAIN",end_of_chain_segment);
 }
 
 #include "regionalloctracking.h"
@@ -5027,10 +5424,12 @@ static void LogBIOSMem(void) {
 Bitu XMS_GetTotalHandles(void);
 bool XMS_GetHandleInfo(Bitu &phys_location,Bitu &size,Bitu &lockcount,bool &free,Bitu handle);
 
+#if !defined(OSFREE)
 bool EMS_GetHandle(Bitu &size,PhysPt &addr,std::string &name,Bitu handle);
 const char *EMS_Type_String(void);
 Bitu EMS_Max_Handles(void);
 bool EMS_Active(void);
+#endif
 
 static void LogFNKEY(void) {
     DEBUG_BeginPagedContent();
@@ -5041,6 +5440,7 @@ static void LogFNKEY(void) {
     DEBUG_EndPagedContent();
 }
 
+#if !defined(OSFREE)
 static void LogEMS(void) {
     Bitu h_size;
     PhysPt xh_addr;
@@ -5111,6 +5511,7 @@ static void LogEMS(void) {
 
     DEBUG_EndPagedContent();
 }
+#endif
 
 static void LogXMS(void) {
     Bitu phys_location;
@@ -5168,6 +5569,43 @@ static void LogDOSKernMem(void) {
     }
 
     DEBUG_EndPagedContent();
+}
+
+// Display the content of all device drivers.
+static void LogDEVS(void) {
+	if (dos_kernel_disabled) {
+		if (boothax == BOOTHAX_MSDOS) {
+			if (guest_msdos_LoL == 0 || guest_msdos_dev_chain == 0) {
+				DEBUG_ShowMsg("Cannot enumerate device list while DOS kernel is inactive, and DOSBox-X has not yet determined the DEV list of the guest MS-DOS operating system");
+				return;
+			}
+
+			DEBUG_BeginPagedContent();
+
+			try {
+				DEBUG_ShowMsg("Header    Attr  Strat Intr  Name");
+				LogDEVChain(guest_msdos_dev_chain);
+			}
+			catch (GuestPageFaultException &pf) {
+				(void)pf;//unused
+				DEBUG_ShowMsg("(Enumeration caused page fault within the guest)");
+			}
+
+			DEBUG_EndPagedContent();
+			return;
+		}
+		else {
+			DEBUG_ShowMsg("Cannot enumerate device list while DOS kernel is inactive.");
+			return;
+		}
+	}
+
+	DEBUG_BeginPagedContent();
+
+	DEBUG_ShowMsg("Header    Attr  Strat Intr  Name");
+	LogDEVChain(dos_infoblock.GetStartOfDeviceChain());
+
+	DEBUG_EndPagedContent();
 }
 
 // Display the content of all Memory Control Blocks.
@@ -5542,18 +5980,21 @@ private:
 };
 #endif
 
-#if C_DEBUG
-extern bool debugger_break_on_exec;
-#endif
-
 void DEBUG_CheckExecuteBreakpoint(uint16_t seg, uint32_t off)
 {
-#if C_DEBUG
+#if !defined(OSFREE)
+# if C_DEBUG
     if (debugger_break_on_exec) {
-		CBreakpoint::AddBreakpoint(seg,off,true);
-		CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
+		// The new entry breakpoint is created at the current CS:IP. The
+		// existing bulk activation intentionally skips that address, so arm
+		// this one explicitly before preserving the other breakpoint state.
+		CBreakpoint* const entry_breakpoint = CBreakpoint::AddBreakpoint(seg,off,true);
+		entry_breakpoint->Activate(true);
+        CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
+		agent_entry_breakpoint_sequence.fetch_add(1, std::memory_order_relaxed);
         debugger_break_on_exec = false;
     }
+# endif
 #endif
 #if 0
 	if (pDebugcom && pDebugcom->IsActive()) {
@@ -5686,6 +6127,14 @@ CDebugVar* CDebugVar::FindVar(PhysPt pt)
 	for(std::vector<CDebugVar*>::size_type i = 0; i != s; i++) {
 		CDebugVar* bp = varList[i];
 		if (bp->GetAdr() == pt) return bp;
+	}
+	return nullptr;
+}
+
+CDebugVar* CDebugVar::FindVar(const std::string& name)
+{
+	for (auto* variable : varList) {
+		if (strcasecmp(name.c_str(), variable->GetName()) == 0) return variable;
 	}
 	return nullptr;
 }
@@ -5897,11 +6346,15 @@ struct TLogInst {
 	bool a;
 	bool p;
 	bool i;
+	uint32_t flags;
 	char dline[31];
 	char res[23];
 };
 
 TLogInst logInst[LOGCPUMAX];
+static bool agent_trace_active = false;
+static uint32_t agent_trace_remaining = 0;
+static vector<DEBUG_AgentTraceEvent> agent_trace_events;
 
 void DEBUG_HeavyLogInstruction(void) {
 
@@ -5950,8 +6403,68 @@ void DEBUG_HeavyLogInstruction(void) {
 	inst.a    = get_AF()>0;
 	inst.p    = get_PF()>0;
 	inst.i    = GETFLAGBOOL(IF);
+	inst.flags = static_cast<uint32_t>(reg_flags);
 
 	if (++logCount >= LOGCPUMAX) logCount = 0;
+}
+
+bool DEBUG_AgentStartTrace(const uint32_t instruction_count)
+{
+	if (instruction_count == 0 || agent_trace_active)
+		return false;
+	agent_trace_events.clear();
+	agent_trace_events.reserve(instruction_count);
+	agent_trace_remaining = instruction_count;
+	agent_trace_active = true;
+	return true;
+}
+
+bool DEBUG_AgentStopTrace(uint32_t* event_count)
+{
+	if (event_count == nullptr)
+		return false;
+	agent_trace_active = false;
+	agent_trace_remaining = 0;
+	*event_count = static_cast<uint32_t>(agent_trace_events.size());
+	return true;
+}
+
+bool DEBUG_AgentTraceIsActive(void)
+{
+	return agent_trace_active;
+}
+
+void DEBUG_AgentCopyTraceEvents(vector<DEBUG_AgentTraceEvent>* events)
+{
+	if (events != nullptr)
+		*events = agent_trace_events;
+}
+
+static void DEBUG_AgentCaptureTraceEvent(void)
+{
+	DEBUG_HeavyLogInstruction();
+	const uint32_t last_index = logCount == 0 ? LOGCPUMAX - 1 : logCount - 1;
+	const TLogInst& inst = logInst[last_index];
+	DEBUG_AgentTraceEvent event;
+	event.cs = inst.s_cs;
+	event.instruction_pointer = inst.eip;
+	event.eax = inst.eax;
+	event.ebx = inst.ebx;
+	event.ecx = inst.ecx;
+	event.edx = inst.edx;
+	event.esi = inst.esi;
+	event.edi = inst.edi;
+	event.ebp = inst.ebp;
+	event.esp = inst.esp;
+	event.ds = inst.s_ds;
+	event.es = inst.s_es;
+	event.fs = inst.s_fs;
+	event.gs = inst.s_gs;
+	event.ss = inst.s_ss;
+	event.flags = inst.flags;
+	event.instruction = inst.dline;
+	event.analysis = inst.res;
+	agent_trace_events.push_back(event);
 }
 
 void DEBUG_HeavyWriteLogInstruction(void) {
@@ -5994,6 +6507,15 @@ void DEBUG_HeavyWriteLogInstruction(void) {
 }
 
 bool DEBUG_HeavyIsBreakpoint(void) {
+	const bool agent_trace_was_active = agent_trace_active;
+	if (agent_trace_active) {
+		DEBUG_AgentCaptureTraceEvent();
+		if (--agent_trace_remaining == 0) {
+			agent_trace_active = false;
+			DEBUG_EnableDebugger();
+			return true;
+		}
+	}
 	if (cpuLog) {
 		if (cpuLogCounter>0) {
 			LogInstruction(SegValue(cs),reg_eip,cpuLogFile);
@@ -6009,7 +6531,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		}
 	}
 	// LogInstruction
-	if (logHeavy) DEBUG_HeavyLogInstruction();
+	if (logHeavy && !agent_trace_was_active) DEBUG_HeavyLogInstruction();
 	if (zeroProtect) {
 		static Bitu zero_count = 0;
 		uint32_t value = 0;
@@ -6044,5 +6566,3 @@ void DEBUG_StopLog(void) {
 
 
 #endif // DEBUG
-
-

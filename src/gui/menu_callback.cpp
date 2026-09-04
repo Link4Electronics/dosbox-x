@@ -33,6 +33,7 @@
 #include "inout.h"
 #include "regs.h"
 #include "cpu.h"
+#include "ide.h"
 #include "../dos/drives.h"
 #include "../ints/int10.h"
 #include "../libs/tinyfiledialogs/tinyfiledialogs.h"
@@ -65,7 +66,6 @@ extern int posx, posy, wheel_key, mbutton, enablelfn, dos_clipboard_device_acces
 extern bool addovl, clearline, pcibus_enable, winrun, window_was_maximized, wheel_guest, clipboard_dosapi, clipboard_biospaste, direct_mouse_clipboard, sync_time, manualtime, pausewithinterrupts_enable, enable_autosave, enable_config_as_shell_commands, noremark_save_state, force_load_state, use_quick_reboot, use_save_file, dpi_aware_enable, pc98_force_ibm_layout, log_int21, log_fileio, x11_on_top, macosx_on_top, rtl, gbk, chinasea, uselangcp;
 extern bool mountfro[26], mountiro[26];
 extern struct BuiltinFileBlob bfb_GLIDE2X_OVL;
-extern const char* RunningProgram;
 extern bool video_debug_overlay;
 
 void MSG_Init(void);
@@ -73,7 +73,9 @@ void SendKey(std::string key);
 void MAPPER_ReleaseAllKeys(void);
 void RENDER_Reset(void);
 void resetFontSize(void);
+#if !defined(OSFREE)
 void EMS_DoShutDown(void);
+#endif
 void DOSV_FillScreen(void);
 void CopyClipboard(int all);
 void res_init(void), change_output(int output);
@@ -84,7 +86,6 @@ void DOSBox_ShowConsole(void);
 void Load_Language(std::string name);
 void RebootLanguage(std::string filename, bool confirm=false);
 void MenuBrowseFolder(char drive, std::string const& drive_type);
-void MenuBrowseImageFile(char drive, bool arc, bool boot, bool multiple);
 void MenuBootDrive(char drive);
 void MenuUnmountDrive(char drive);
 void DOSBox_SetSysMenu(void);
@@ -230,6 +231,7 @@ bool drive_mountauto_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * co
     (void)menu;//UNUSED
     (void)menuitem;//UNUSED
 
+#if !defined(OSFREE)
     /* menu item has name "drive_A_" ... */
     int drive;
     const char *mname = menuitem->get_name().c_str();
@@ -246,6 +248,7 @@ bool drive_mountauto_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * co
 	char root[4]="A:\\";
 	root[0]=drive+'A';
     MenuMountDrive(drive+'A', root);
+#endif
 
     return true;
 }
@@ -382,11 +385,23 @@ bool drive_mountimg_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * con
         drive = mname[6] - 'A';
         if (drive < 0 || drive >= DOS_DRIVES) return false;
     }
+    else if (!strncmp(mname,"IDEDrive",8)) { /* IDEDrive1m for example */
+        const char *s = mname + 8;
+        const char *e = s; while (isdigit(*e)) e++; if (*e == 'm' || *e == 's') e++;
+        const std::string opts = std::string(s,(size_t)(e-s));
+
+        MAPPER_ReleaseAllKeys();
+        GFX_LosingFocus();
+        GFX_ReleaseMouse();
+        MenuBrowseImageFile(-1, false, false, false, "ide", opts);
+        MAPPER_ReleaseAllKeys();
+        GFX_LosingFocus();
+
+        return true;
+    }
     else {
         return false;
     }
-
-    if (dos_kernel_disabled) return true;
 
     MAPPER_ReleaseAllKeys();
     GFX_LosingFocus();
@@ -409,11 +424,23 @@ bool drive_mountimgs_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * co
         drive = mname[6] - 'A';
         if (drive < 0 || drive >= DOS_DRIVES) return false;
     }
+    else if (!strncmp(mname,"IDEDrive",8)) { /* IDEDrive1m for example */
+        const char *s = mname + 8;
+        const char *e = s; while (isdigit(*e)) e++; if (*e == 'm' || *e == 's') e++;
+        const std::string opts = std::string(s,(size_t)(e-s));
+
+        MAPPER_ReleaseAllKeys();
+        GFX_LosingFocus();
+        GFX_ReleaseMouse();
+        MenuBrowseImageFile(-1, false, false, true, "ide", opts);
+        MAPPER_ReleaseAllKeys();
+        GFX_LosingFocus();
+
+        return true;
+    }
     else {
         return false;
     }
-
-    if (dos_kernel_disabled) return true;
 
     MAPPER_ReleaseAllKeys();
     GFX_LosingFocus();
@@ -497,7 +524,7 @@ bool drive_saveimg_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * cons
             chdir(Temp_CurrentDir);
             return true;
         }
-    if (dos_kernel_disabled || !strcmp(RunningProgram, "LOADLIN")) return false;
+    if (dos_kernel_disabled || RunningProgram == "LOADLIN") return false;
     Section_prop *sec = static_cast<Section_prop *>(control->GetSection("dosbox"));
     uint32_t freeMB = sec->Get_int("convert fat free space"), timeout = sec->Get_int("convert fat timeout");
     imageDisk *imagedrv = new imageDisk(Drives[drive], drive, freeMB, timeout);
@@ -513,6 +540,8 @@ bool drive_saveimg_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * cons
     return true;
 }
 
+bool IDE_CDROM_Eject(int index,bool slave);
+
 bool drive_unmount_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuitem) {
     (void)menu;//UNUSED
     (void)menuitem;//UNUSED
@@ -524,11 +553,26 @@ bool drive_unmount_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * cons
         drive = mname[6] - 'A';
         if (drive < 0 || drive >= DOS_DRIVES) return false;
     }
+    else if (!strncmp(mname,"IDEDrive",8)) { /* IDEDrive1m for example */
+        const char *s = mname + 8;
+        int idx = (int)strtoul(s,(char**)(&s),10) - 1;
+        bool ms = false;
+
+        if (*s == 'm') {
+                ms = false;
+                s++;
+        }
+        else if (*s == 's') {
+                ms = true;
+                s++;
+        }
+
+        IDE_CDROM_Eject(idx,ms);
+        return true;
+    }
     else {
         return false;
     }
-
-    if (dos_kernel_disabled) return true;
 
     MenuUnmountDrive(drive+'A');
 
@@ -536,6 +580,7 @@ bool drive_unmount_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * cons
 }
 
 void swapInDrive(int drive, unsigned int position=0);
+void IDE_ATAPI_MediaChangeNotify(signed char index, bool slave, bool immediate);
 bool drive_swap_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuitem) {
     (void)menu;//UNUSED
     (void)menuitem;//UNUSED
@@ -547,11 +592,26 @@ bool drive_swap_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const m
         drive = mname[6] - 'A';
         if (drive < 0 || drive >= DOS_DRIVES) return false;
     }
+    else if (!strncmp(mname,"IDEDrive",8)) { /* IDEDrive1m for example */
+        const char *s = mname + 8;
+        int idx = (int)strtoul(s,(char**)(&s),10) - 1;
+        bool ms = false;
+
+        if (*s == 'm') {
+                ms = false;
+                s++;
+        }
+        else if (*s == 's') {
+                ms = true;
+                s++;
+        }
+
+        IDE_ATAPI_MediaChangeNotify(idx,ms,!dos_kernel_disabled);
+        return true;
+    }
     else {
         return false;
     }
-
-    if (dos_kernel_disabled) return true;
 
     if (drive < DOS_DRIVES && Drives[drive]) {
         LOG(LOG_DOSMISC,LOG_DEBUG)("Triggering swap on drive %c",drive+'A');
@@ -696,6 +756,7 @@ bool change_currentcd_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * c
 }
 
 bool change_currentfd_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuitem) {
+#if !defined(OSFREE)
     (void)menu;//UNUSED
     (void)menuitem;//UNUSED
     int num=0;
@@ -710,11 +771,12 @@ bool change_currentfd_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * c
         } else if (imageDiskList[idrive])
             MenuBrowseFDImage('A'+idrive, ++num, -1);
     }
-#if !defined(HX_DOS)
+# if !defined(HX_DOS)
     if (!num) tinyfd_messageBox("Error","No floppy drive is currently available.","ok","error", 1);
-#endif
+# endif
     MAPPER_ReleaseAllKeys();
     GFX_LosingFocus();
+#endif
     return true;
 }
 
@@ -840,9 +902,11 @@ bool dos_ems_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menu
     if (tmp.size()) {
         Section_prop * dos_section = static_cast<Section_prop *>(control->GetSection("dos"));
         dos_section->HandleInputline(tmp.c_str());
+#if !defined(OSFREE)
         EMS_DoShutDown();
         void EMS_Startup(Section* sec);
         EMS_Startup(NULL);
+#endif
         update_dos_ems_menu();
     }
     return true;
@@ -1933,6 +1997,10 @@ bool voodoo_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menui
 }
 
 bool glide_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuitem) {
+#if defined(OSFREE)
+    (void)menu;
+    (void)menuitem;
+#else
     (void)menu;//UNUSED
     (void)menuitem;//UNUSED
     Section_prop *section = static_cast<Section_prop *>(control->GetSection("voodoo"));
@@ -1948,6 +2016,7 @@ bool glide_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const menuit
         if (!glideon) systemmessagebox("Warning", MSG_Get("MENU_GLIDE_ERROR"), "ok","warning", 1);
     }
     mainMenu.get_item("3dfx_glide").check(addovl).refresh_item(mainMenu);
+#endif
     return true;
 }
 
@@ -2146,7 +2215,7 @@ bool clear_screen() {
 }
 
 void show_prompt() {
-    if (!dos_kernel_disabled && !strcmp(RunningProgram, "COMMAND")) {
+    if (!dos_kernel_disabled && RunningProgram == "COMMAND") {
         DOS_Shell temp;
         temp.exit = true;
         temp.ShowPrompt();
@@ -2165,7 +2234,7 @@ bool intensity_menu_callback(DOSBoxMenu * const menu,DOSBoxMenu::item * const me
     (void)menu;//UNUSED
     const char *mname = menuitem->get_name().c_str();
     uint16_t oldax=reg_ax, oldbx=reg_bx;
-    if (IS_PC98_ARCH||machine==MCH_CGA||(CurMode->mode>7&&CurMode->mode!=0x0019&&CurMode->mode!=0x0043&&CurMode->mode!=0x0054&&CurMode->mode!=0x0055&&CurMode->mode!=0x0064)) {
+    if (IS_PC98_ARCH||machine==MCH_CGA||machine==MCH_OLIVETTI||machine==MCH_3270PC||(CurMode->mode>7&&CurMode->mode!=0x0019&&CurMode->mode!=0x0043&&CurMode->mode!=0x0054&&CurMode->mode!=0x0055&&CurMode->mode!=0x0064)) {
         systemmessagebox("Warning", MSG_Get("MENU_HIGH_INTENSITY_ERROR"), "ok","warning", 1);
         return true;
     }
@@ -3323,6 +3392,10 @@ void AllocCallback1() {
                 mainMenu.alloc_item(DOSBoxMenu::item_type_id,"output_gamelink").set_text("Game Link").
                     set_callback_function(output_menu_callback);
 #endif
+#if defined(MACOSX) && defined(C_SDL2) && C_METAL
+                mainMenu.alloc_item(DOSBoxMenu::item_type_id, "output_metal").set_text("Metal(Experimental)").
+                    set_callback_function(output_menu_callback);
+#endif
                 mainMenu.alloc_item(DOSBoxMenu::item_type_id,"doublescan").set_text("Doublescan").
                     set_callback_function(doublescan_menu_callback);
 #if C_SDL2
@@ -3639,6 +3712,13 @@ void AllocCallback1() {
 #  else
                 enable(false);
 #  endif
+                mainMenu.alloc_item(DOSBoxMenu::item_type_id,"capture_fmt_mpegts_h265").set_text("MPEG-TS + H.265").
+                    set_callback_function(capture_fmt_menu_callback).
+#  if (C_AVCODEC)
+                enable(true);
+#  else
+                enable(false);
+#  endif
             }
         }
 # endif
@@ -3708,6 +3788,30 @@ void AllocCallback1() {
                         mainMenu.alloc_item(DOSBoxMenu::item_type_id,name).set_text(drive_opts[i][1]).set_callback_function(drive_callbacks[i]);
                 }
             }
+
+	    {
+                char name[128],tmp[128];
+
+                /* Additional menus for IDE-only device mounts */
+                for (unsigned int ide=0;ide < MAX_IDE_CONTROLLERS;ide++) {
+                    for (unsigned int ms=0;ms < 2;ms++) {
+                        sprintf(name,"IDEDrive%u%c",ide+1,ms?'s':'m');
+                        sprintf(tmp,"IDE %u%c",ide+1,ms?'s':'m');
+
+                        DOSBoxMenu::item &ditem = mainMenu.alloc_item(DOSBoxMenu::submenu_type_id,name);
+                        ditem.set_text(tmp);
+
+                        for (size_t i=0;drive_opts[i][0] != NULL;i++) {
+	                    const std::string sname = std::string(name) + "_" + drive_opts[i][0];
+                            if (!strcmp(drive_opts[i][1], "--"))
+                                mainMenu.alloc_item(DOSBoxMenu::separator_type_id,sname);
+                            else
+                                mainMenu.alloc_item(DOSBoxMenu::item_type_id,sname).set_text(drive_opts[i][1]).set_callback_function(drive_callbacks[i]);
+	                }
+	            }
+	        }
+	    }
+
         }
 
         {
@@ -3820,6 +3924,7 @@ void AllocCallback2() {
         mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_winlogo").set_text("Send logo key").set_callback_function(sendkey_preset_menu_callback);
         mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_winmenu").set_text("Send menu key").set_callback_function(sendkey_preset_menu_callback);
         mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_alttab").set_text("Send Alt+Tab").set_callback_function(sendkey_preset_menu_callback);
+        mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_altsysrq").set_text("Send Alt+SysRq/PrtScr").set_callback_function(sendkey_preset_menu_callback);
         mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_ctrlesc").set_text("Send Ctrl+Esc").set_callback_function(sendkey_preset_menu_callback);
         mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_ctrlbreak").set_text("Send Ctrl+Break").set_callback_function(sendkey_preset_menu_callback);
         mainMenu.alloc_item(DOSBoxMenu::item_type_id,"sendkey_cad").set_text("Send Ctrl+Alt+Del").set_callback_function(sendkey_preset_menu_callback);
