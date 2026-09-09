@@ -52,7 +52,9 @@
 #include <ctime>
 #include <unistd.h>
 #include "dosbox.h"
+#if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
 #include "agent/agent_bridge.h"
+#endif // defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
 #include "debug.h"
 #include "cpu.h"
 #include "logging.h"
@@ -467,7 +469,9 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+#if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
             dosbox_agent::AGENT_BridgePump();
+#endif
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
                 CPU_Check_NMI();
@@ -739,9 +743,9 @@ volatile int runmachine_recursion = 0;
 
 void DOSBOX_RunMachine(void){
     Bitu ret;
-
+#if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
     dosbox_agent::AGENT_BridgeAttachToCurrentThread();
-
+#endif
     extern unsigned int last_callback;
     unsigned int p_last_callback = last_callback;
     last_callback = 0;
@@ -1762,6 +1766,10 @@ void DOSBOX_SetupConfigSections(void) {
 
     Pbool = secprop->Add_bool("bochs debug port e9",Property::Changeable::WhenIdle,false);
     Pbool->Set_help("If set, emulate Bochs debug port E9h. ASCII text written to this I/O port is assumed to be debug output, and logged.");
+
+    Pint = secprop->Add_int("mcp_server", Property::Changeable::OnlyAtStart, 0);
+    Pint->SetMinMax(0, 65535);
+    Pint->Set_help("TCP port of the external debugger MCP server on 127.0.0.1. Set to 0 to disable debugger MCP control.");
 
     Pstring = secprop->Add_string("machine",Property::Changeable::OnlyAtStart,"svga_s3");
     Pstring->Set_values(machines);
