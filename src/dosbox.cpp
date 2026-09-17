@@ -1491,7 +1491,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char* autofix_settings[] = { "true", "false", "1", "0", "both", "a20fix", "loadfix", "none", nullptr };
     const char* color_themes[] = { "default", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", nullptr };
     const char* color_themes_config[] = {
-        "Windows Default", "Arizona", "Black Leather Jacket", "Bordeaux", "Cinnamon", "Designer", "Emerald City",
+        "", "Windows Default", "Arizona", "Black Leather Jacket", "Bordeaux", "Cinnamon", "Designer", "Emerald City",
         "Fluorescent","HotDog Stand", "LCD Default Screen Settings", "LCD Reversed - Dark", "LCD Reversed - Light",
         "Mahogany", "Monochrome", "Ocean", "Pastel", "Patchwork", "Plasma Power Saver", "Rugby", "The Blues",
         "Tweed", "Valentine", "Wingtips", nullptr };
@@ -2351,7 +2351,7 @@ void DOSBOX_SetupConfigSections(void) {
     Pmulti = secprop->Add_multi("monochrome_pal",Property::Changeable::Always," ");
     Pmulti->SetValue("green",/*init*/true);
     Pmulti->Set_help("Specify the color of monochrome display.\n"
-            "Append 'bright' for a brighter look.");
+            "Append ' bright' (space-separated) for a brighter look (only applies to machine=cga_mono; has no effect on Hercules/MDA).");
     Pmulti->SetBasic(true);
     Pstring = Pmulti->GetSection()->Add_string("color",Property::Changeable::Always,"green");
     const char* monochrome_pal_colors[]={"green","amber","gray","white",nullptr};
