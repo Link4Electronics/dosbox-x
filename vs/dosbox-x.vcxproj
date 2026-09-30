@@ -1262,6 +1262,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\dos\drive_virtual.cpp" />
     <ClCompile Include="..\src\dos\eltorito.cpp" />
     <ClCompile Include="..\src\fpu\fpu.cpp" />
+    <ClCompile Include="..\src\fpu\fpu_float80.cpp" />
     <ClCompile Include="..\src\gamelink\gamelink.cpp" />
     <ClCompile Include="..\src\gamelink\gamelink_term.cpp" />
     <ClCompile Include="..\src\gui\bitop.cpp" />
@@ -1517,6 +1518,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\hardware\adlib.cpp" />
     <ClCompile Include="..\src\hardware\cmos.cpp" />
     <ClCompile Include="..\src\hardware\cs4231.cpp" />
+    <ClCompile Include="..\src\hardware\emu8k.cpp" />
     <ClCompile Include="..\src\hardware\dbopl.cpp" />
     <ClCompile Include="..\src\hardware\disney.cpp" />
     <ClCompile Include="..\src\hardware\pas.cpp" />
@@ -1600,6 +1602,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\hardware\vga_paradise.cpp" />
     <ClCompile Include="..\src\hardware\vga_ati.cpp" />
     <ClCompile Include="..\src\hardware\vga_s3.cpp" />
+    <ClCompile Include="..\src\hardware\vga_s3d.cpp" />
     <ClCompile Include="..\src\hardware\vga_seq.cpp" />
     <ClCompile Include="..\src\hardware\vga_tseng.cpp" />
     <ClCompile Include="..\src\hardware\vga_xga.cpp" />
@@ -1760,6 +1763,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\include\cross.h" />
     <ClInclude Include="..\include\crypt.h" />
     <ClInclude Include="..\include\cs4231.h" />
+    <ClInclude Include="..\include\emu8k.h" />
     <ClInclude Include="..\include\debug.h" />
     <ClInclude Include="..\include\agent\agent_bridge.h" />
     <ClInclude Include="..\include\agent\agent_protocol.h" />
@@ -1901,6 +1905,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\src\dos\scsidefs.h" />
     <ClInclude Include="..\src\dos\wnaspi32.h" />
     <ClInclude Include="..\src\fpu\fpu_instructions.h" />
+    <ClInclude Include="..\src\fpu\fpu_float80.h" />
     <ClInclude Include="..\src\fpu\fpu_instructions_longdouble.h" />
     <ClInclude Include="..\src\fpu\fpu_instructions_x86.h" />
     <ClInclude Include="..\src\gamelink\gamelink.h" />

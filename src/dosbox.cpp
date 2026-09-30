@@ -1458,7 +1458,7 @@ void DOSBOX_SetupConfigSections(void) {
     const char *mt32reverbTimes[] = {"0", "1", "2", "3", "4", "5", "6", "7", nullptr};
     const char *mt32reverbLevels[] = {"0", "1", "2", "3", "4", "5", "6", "7", nullptr};
     const char* gustypes[] = { "classic", "classic37", "max", "interwave", nullptr };
-    const char* sbtypes[] = { "sb1", "sb1.0", "sb1.5", "sb2", "sb2.0", "sb2.01", "sbpro1", "sbpro2", "sb16", "sb16vibra", "gb", "ess688", "ess1688", "reveal_sc400", "pas", "pasplus", "pas16", "none", nullptr };
+    const char* sbtypes[] = { "sb1", "sb1.0", "sb1.5", "sb2", "sb2.0", "sb2.01", "sbpro1", "sbpro2", "sb16", "sb16vibra", "awe32", "gb", "ess688", "ess1688", "reveal_sc400", "pas", "pasplus", "pas16", "none", nullptr };
     const char* cms_settings[] = { "on", "off", "auto", nullptr };
     const char* oplmodes[] = { "auto", "opl2", "dualopl2", "opl3", "opl3gold", "none", "hardware", "hardwaregb", "esfm", nullptr };
     const char* serials[] = { "dummy", "disabled", "modem", "nullmodem", "serialmouse", "directserial", "log", "file", nullptr };
@@ -2820,6 +2820,15 @@ void DOSBOX_SetupConfigSections(void) {
     Pbool->Set_help("When machine=cga, determines whether or not to emulate CGA snow in 80x25 text mode.\n"
                     "This parameter is also changeable from the builtin CGASNOW command in CGA mode.");
 
+    const char* compositeopts[] = { "default", "auto", "on", "off", nullptr };
+    Pstring = secprop->Add_string("composite",Property::Changeable::Always,"default");
+    Pstring->Set_values(compositeopts);
+    Pstring->Set_help("CGA/PCjr composite output, the setting that the CGA Composite hotkey (Ctrl+F8) cycles through.\n"
+                    "  default: As chosen by machine= (on for cga_composite and pcjr_composite, off for cga_rgb, else auto).\n"
+                    "  auto:    Composite when a program selects 640x200 graphics with the color burst enabled.\n"
+                    "  on, off: Always or never composite.\n"
+                    "Can be changed while running, e.g. CONFIG -set composite=on. Has no effect for machine=cga_mono or non-CGA machines.");
+
     /* Default changed to 0x04 for "Blues Brothers" at Allofich's request [https://github.com/joncampbell123/dosbox-x/issues/1273] */
     Phex = secprop->Add_hex("vga 3da undefined bits",Property::Changeable::WhenIdle,0x04);
     Phex->Set_help("VGA status port 3BA/3DAh only defines bits 0 and 3. This setting allows you to assign a bit pattern to the undefined bits.\n"
@@ -3245,6 +3254,16 @@ void DOSBOX_SetupConfigSections(void) {
                     "If the dynamic_x86 core is set, this allows Windows 9x/ME to run properly, but may somewhat decrease the performance.\n"
                     "If the dynamic_rec core is set, this disables the dynamic core if the 386 paging functions are currently enabled.\n"
                     "If set to auto, this option will be enabled depending on if the 386 paging and a guest system are currently active.");
+
+    // this is an option, even if enabling it will cause problems with Windows 95 games, because
+    // perhaps someone needs dynamic core for their DOS gaming because "ever since you added this
+    // option my Quake FPS is slower than DOSBox SVN why did you break it etc. etc."
+    Pstring = secprop->Add_string("use dynamic core with fpu",Property::Changeable::Always,"auto");
+    Pstring->Set_values(truefalseautoopt);
+    Pstring->Set_help("Allow dynamic cores (dynamic_x86 and dynamic_rec) to handle floating point, MMX, and SSE instructions.\n"
+                    "Set this option to true if running DOS games in a pure DOS environment.\n"
+                    "Set this option to false or leave it set to auto if you will be running a multi-tasking environment and an application that uses the FPU,\n"
+                    "especially Windows 95-era or later games in Microsoft Windows where dynamic core cannot properly allow Windows 95 to task switch the FPU.");
 
     Pbool = secprop->Add_bool("ignore opcode 63",Property::Changeable::Always,true);
     Pbool->Set_help("When debugging, do not report illegal opcode 0x63.\n"
@@ -3799,6 +3818,7 @@ void DOSBOX_SetupConfigSections(void) {
 			Pstring = secprop->Add_string("sbtype",Property::Changeable::WhenIdle,def_sbtype[ci]);//"sb16"
 			Pstring->Set_values(sbtypes);
 			Pstring->Set_help("Type of Sound Blaster to emulate. 'gb' is Game Blaster.\n"
+					"'awe32' is Creative Sound Blaster 16 plus EMU8000 wavetable synthesizer.\n"
 					"'pas', 'pasplus' and 'pas16' are the Media Vision Pro AudioSpectrum, Pro AudioSpectrum Plus and\n"
 					"Pro AudioSpectrum 16 (first card only). The original PAS has no Sound Blaster mode; it uses irq= and dma=\n"
 					"for its own PCM. The Plus and 16 start their Sound Blaster 2.0 emulation at sbbase=, irq= and dma=,\n"
@@ -4066,6 +4086,18 @@ void DOSBOX_SetupConfigSections(void) {
 					"This is a hack for the Electromotive Force 'Internal Damage' demo which apparently\n"
 					"relies on this behavior for Sound Blaster output and should be enabled for accuracy in emulation.");
 		}
+	}
+
+	{
+		const char *emu8krams[] = { "0", "512", "2048", "8192", "28672", nullptr };
+		secprop=control->AddSection_prop("emu8k",&Null_Init,true);
+		Pstring = secprop->Add_string("rompath",Property::Changeable::WhenIdle,"awe32.raw");
+		Pstring->Set_help("Path to the 1MB AWE32 GM ROM dump (awe32.raw). The EMU8000 stays inactive if this file cannot be loaded.");
+		Pstring->SetBasic(true);
+		Pint = secprop->Add_int("memsize",Property::Changeable::WhenIdle,512);
+		Pint->Set_values(emu8krams);
+		Pint->Set_help("Onboard EMU8000 sample RAM in KB. Guest software uploads extra samples here.");
+		Pint->SetBasic(true);
 	}
 
     secprop=control->AddSection_prop("gus",&Null_Init,true); //done

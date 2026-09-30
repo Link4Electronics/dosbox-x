@@ -282,6 +282,7 @@ typedef enum PROCESS_DPI_AWARENESS {
 #include "keyboard.h"
 #include "cpu.h"
 #include "fpu.h"
+#include "logging.h"
 #include "cross.h"
 #include "keymap.h"
 #include "voodoo.h"
@@ -775,6 +776,7 @@ void DOS_ShutdownFiles();
 void FreeBIOSDiskList();
 void GFX_ShutDown(void);
 void MAPPER_Shutdown();
+void RENDER_Shutdown();
 void SHELL_Init(void);
 void SHELL_MessagesInit(void);
 void CopyClipboard(int all);
@@ -10671,6 +10673,7 @@ fresh_boot:
         CPU_Core_Dyn_X86_Shutdown();
 #endif
         FreeBIOSDiskList();
+        RENDER_Shutdown();
         MAPPER_Shutdown();
         VFILE_Shutdown();
         PROGRAMS_Shutdown();
