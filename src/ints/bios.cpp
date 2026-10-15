@@ -4410,6 +4410,14 @@ static Bitu INT18_PC98_Handler(void) {
                 }
             }
             break;
+        case 0x1B: /* set KCG access mode (AL=0 code access, AL=1 dot access) */
+            /* Same mode as bit 3 of AH=0Ah, and kept in the same place in the data area,
+             * so that AH=0Bh reads it back. Neko Project II handles this call the same way. */
+            if (reg_al <= 1) {
+                mem_writeb(0x53C,(mem_readb(0x53C) & ~0x08u) | (reg_al ? 0x08u : 0x00u));
+                pc98_cg_kanji_dot_access_mode = (reg_al != 0);
+            }
+            break;
         case 0x30: /* Set display mode */
             /* FIXME: There is still a lot that is inaccurate about this call */
             if (enable_pc98_egc) {
@@ -13007,7 +13015,10 @@ void BIOS_OnPowerOn(Section* sec) {
 }
 
 void swapInNextDisk(bool pressed);
+void swapInPrevDisk(bool pressed);
+void swapInCD(bool pressed, bool rev);
 void swapInNextCD(bool pressed);
+void swapInPrevCD(bool pressed);
 
 void INT10_OnResetComplete();
 void CALLBACK_DeAllocate(Bitu in);
@@ -13066,8 +13077,15 @@ void BIOS_Init() {
     MAPPER_AddHandler(swapInNextDisk,MK_o,MMODHOST,"swapimg","Swap floppy drive",&item); /* Originally "Swap Image" but this version does not swap CDs */
     item->set_text("Swap floppy drive");
 
+    /* make sure CD swap and floppy swap mapper events are available */
+    MAPPER_AddHandler(swapInPrevDisk, MK_o, MMODHOST | MMOD3, "swapimgrev", "Swap floppy drive (prev)", &item); /*  */
+    item->set_text("Swap floppy drive (prev)");
+
     MAPPER_AddHandler(swapInNextCD,MK_d,MMODHOST,"swapcd","Swap CD drive",&item); /* Variant of "Swap Image" for CDs */
     item->set_text("Swap CD drive");
+
+    MAPPER_AddHandler(swapInPrevCD, MK_d, MMODHOST | MMOD3, "swapcdrev", "Swap CD drive (prev)", &item); /* Variant of "Swap Image" for CDs */
+    item->set_text("Swap CD drive (prev)");
 
     /* NTS: VM_EVENT_BIOS_INIT this callback must be first. */
     AddExitFunction(AddExitFunctionFuncPair(BIOS_Destroy),false);

@@ -20,7 +20,9 @@
 #include "dosbox.h"
 #if C_DEBUG
 #include <cctype>
+#include <cstdint>
 #include <cstring>
+#include <ios>
 #include <list>
 #include <vector>
 #include <fstream>
@@ -29,7 +31,16 @@
 #include <sstream>
 using namespace std;
 
+#if defined(__GNUC__) && !defined(__clang__)
+// GCC incorrectly reports an uninitialized matcher in the bundled GoogleMock
+// test sources when they are compiled into this translation unit.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include "../../tests/tests.h"
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #include "debug.h"
 #if defined(C_DOSBOX_AGENT)
@@ -164,8 +175,8 @@ void DEBUG_PrintRTC();
 static void DrawCode(void);
 static void DrawInput(void);
 static void DEBUG_RaiseTimerIrq(void);
-static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename);
-static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename);
+static void SaveMemory(const char *filename, uint16_t seg, uint32_t ofs1, uint32_t num);
+static void SaveMemoryBin(const char *filename, uint16_t seg, uint32_t ofs1, uint32_t num);
 static void LogDEVS(void);
 static void LogMCBS(void);
 static void LogGDT(void);
@@ -419,7 +430,7 @@ static char* F80ToString(int regIndex, char* dest) {
 #elif defined(HAS_LONG_DOUBLE)
 	snprintf(dest, 11, "%08.2Lf", fpu.regs_80[regIndex].v);
 #else
-	snprintf(dest, 11, "%08.2f", fpu.regs[regIndex].d);
+	snprintf(dest, 11, "%08.2f", fpu.regs[regIndex].v);
 #endif
 	
 	return dest;
@@ -435,7 +446,7 @@ static bool F80TestUpdate(int regIndex) {
 #elif defined(HAS_LONG_DOUBLE)
 	return fpu.regs_80[regIndex].v != oldfpu.regs_80[regIndex].v; /* I'm certain that strict float equality can be used here. */
 #else
-	return fpu.regs[regIndex].d != oldfpu.regs[regIndex].d;
+	return fpu.regs[regIndex].v != oldfpu.regs[regIndex].v;
 #endif
 }
 
@@ -2163,6 +2174,26 @@ void VGA_DumpFontRamBIN(const char *filename);
 void VGA_DumpFontRamBMP(const char *filename);
 int32_t DEBUG_Run(int32_t amount,bool quickexit);
 
+static bool ParseMemoryDumpArguments(char *&found, uint16_t &seg, uint32_t &ofs, uint32_t &num) {
+	bool parsed = false;
+	uint32_t segment = GetHexValue(found,found,&parsed);
+	if (!parsed || segment > 0xffffu) return false;
+	seg = (uint16_t)segment;
+
+	SkipSpace(found);
+	if (*found != ':') return false;
+	found++;
+
+	ofs = GetHexValue(found,found,&parsed);
+	if (!parsed || *found != ' ') return false;
+	SkipSpace(found);
+
+	num = GetHexValue(found,found,&parsed);
+	if (!parsed || (*found != '\0' && *found != ' ')) return false;
+	SkipSpace(found);
+	return true;
+}
+
 bool ParseCommand(char* str) {
     std::string copy_str = str;
     for (auto &c : copy_str) c = toupper(c);
@@ -2242,20 +2273,24 @@ bool ParseCommand(char* str) {
     }
 
 	if (command == "MEMDUMP") { // Dump memory to file
-		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
-		uint32_t ofs = GetHexValue(found,found); found++;
-		uint32_t num = GetHexValue(found,found); found++;
-		SkipSpace(found);
-		SaveMemory(seg,ofs,num,*found ? found : "MEMDUMP.TXT");
+		uint16_t seg;
+		uint32_t ofs, num;
+		if (!ParseMemoryDumpArguments(found,seg,ofs,num)) {
+			DEBUG_ShowMsg("DEBUG: Invalid memory dump arguments. Usage: MEMDUMP seg:off len [filename].\n");
+			return true;
+		}
+		SaveMemory(*found ? found : "MEMDUMP.TXT",seg,ofs,num);
 		return true;
 	}
 
 	if (command == "MEMDUMPBIN") { // Dump memory to file binary
-		uint16_t seg = (uint16_t)GetHexValue(found,found); found++;
-		uint32_t ofs = GetHexValue(found,found); found++;
-		uint32_t num = GetHexValue(found,found); found++;
-		SkipSpace(found);
-		SaveMemoryBin(seg,ofs,num,*found ? found : "MEMDUMP.BIN");
+		uint16_t seg;
+		uint32_t ofs, num;
+		if (!ParseMemoryDumpArguments(found,seg,ofs,num)) {
+			DEBUG_ShowMsg("DEBUG: Invalid memory dump arguments. Usage: MEMDUMPBIN seg:off len [filename].\n");
+			return true;
+		}
+		SaveMemoryBin(*found ? found : "MEMDUMP.BIN",seg,ofs,num);
 		return true;
 	}
 
@@ -2911,6 +2946,71 @@ bool ParseCommand(char* str) {
 		mainMenu.get_item("debugger_runnormal").check(false).refresh_item(mainMenu);
 		mainMenu.get_item("debugger_runwatch").check(true).refresh_item(mainMenu);
 		DEBUG_DrawScreen();
+		return true;
+	}
+
+	if (command == "STEPIN") {
+		/* External single-instruction step-into. Mirrors the KEY_F(11) trace-into
+		 * path so the CPU decoder executes exactly one guest instruction inside
+		 * DEBUG_Run(1,true) and returns before the command response is sent;
+		 * execution therefore stays stopped in the debugger loop. */
+		if (!debugging || debug_running) {
+			DEBUG_ShowMsg("DEBUG: STEPIN requires the debugger to be stopped\n");
+			return false;
+		}
+		exitLoop = false;
+		mustCompleteInstruction = true;
+		DEBUG_Run(1,true);
+		mustCompleteInstruction = false;
+		DEBUG_ShowMsg("DEBUG: STEPIN CS:IP=%04X:%04X AX=%04X BX=%04X CX=%04X DX=%04X\n",
+			SegValue(cs),reg_eip,reg_ax,reg_bx,reg_cx,reg_dx);
+		/* Keep the interactive display truthful after an external step. The
+		 * F10/F11 key handlers refresh it, but an EXEC STEPIN bypasses them and
+		 * check_rescroll has already been consumed, so do it explicitly with the
+		 * existing update routines. */
+		DrawRegistersUpdateOld();
+		DEBUG_DrawScreen();
+		return true;
+	}
+
+	if (command == "MEMREAD") {
+		/* External bounded memory observation: returns the actual conventional
+		 * RAM bytes through the debugger response. Read-only - it never executes
+		 * a guest instruction, never writes guest memory or files, and refuses a
+		 * request it cannot fully satisfy instead of substituting zero bytes. */
+		if (!debugging || debug_running) {
+			DEBUG_ShowMsg("DEBUG: MEMREAD requires the debugger to be stopped\n");
+			return false;
+		}
+		if (cpu.pmode) {
+			DEBUG_ShowMsg("DEBUG: MEMREAD supports real mode only\n");
+			return false;
+		}
+		unsigned long seg = 0, ofs = 0, len = 0;
+		int consumed = 0;
+		char trailing = 0;
+		if (sscanf(found, "%lx:%lx %lx%n", &seg, &ofs, &len, &consumed) != 3
+				|| sscanf(found + consumed, " %c", &trailing) == 1
+				|| seg > 0xFFFF || ofs > 0xFFFF || len < 1 || len > 256
+				|| ofs + len > 0x10000) {
+			DEBUG_ShowMsg("DEBUG: MEMREAD usage: MEMREAD <seg>:<off> <length 1-256> (hex)\n");
+			return false;
+		}
+		unsigned long phys = seg * 16 + ofs;
+		if (phys + len > 0xA0000) {
+			DEBUG_ShowMsg("DEBUG: MEMREAD reads conventional RAM below A0000h only\n");
+			return false;
+		}
+		char hex[2 * 256 + 1];
+		for (unsigned long i = 0; i < len; i++) {
+			uint8_t value = 0;
+			if (mem_readb_checked((PhysPt)(phys + i), &value)) {
+				DEBUG_ShowMsg("DEBUG: MEMREAD cannot read %04lX:%04lX\n", seg, ofs + i);
+				return false;
+			}
+			snprintf(&hex[i * 2], 3, "%02X", (unsigned)value);
+		}
+		DEBUG_ShowMsg("DEBUG: MEMREAD %04lX:%04lX LEN=%04lX HEX=%s\n", seg, ofs, len, hex);
 		return true;
 	}
 
@@ -4260,6 +4360,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("BIOS MEM                  - Show BIOS memory blocks.\n");
 		DEBUG_ShowMsg("CALLBACKS                 - Show callbacks of interrupts.\n");
 		DEBUG_ShowMsg("INT [nr] / INTT [nr]      - Execute / Trace into interrupt.\n");
+		DEBUG_ShowMsg("MEMREAD <seg>:<off> <len> - Read 1-256 conventional RAM bytes (external).\n");
+		DEBUG_ShowMsg("STEPIN                    - Execute exactly one instruction, then stop.\n");
 #if C_HEAVY_DEBUG
 		DEBUG_ShowMsg("LOG [num]                 - Write CPU log file.\n");
 		DEBUG_ShowMsg("LOGS/LOGL/LOGC [num]      - Write short/long/cs:ip-only CPU log file.\n");
@@ -4280,8 +4382,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("VGA cmd                   - VGA related debugging commands.\n");
 		DEBUG_ShowMsg("PC98 cmd                  - PC98 related debugging commands.\n");
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
-		DEBUG_ShowMsg("MEMDUMP [seg]:[off] [len] [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
-		DEBUG_ShowMsg("MEMDUMPBIN [s]:[o] [len] [filename]  - Write memory to a binary file (default: MEMDUMP.BIN).\n");
+		DEBUG_ShowMsg("MEMDUMP seg:off len [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
+		DEBUG_ShowMsg("MEMDUMPBIN seg:off len [filename] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
         DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
@@ -5834,7 +5936,7 @@ static void LogFPUInfo(void) {
                       fpu.regs_80[adj].v, fpu.regs_80[adj].raw.h, (unsigned long long)fpu.regs_80[adj].raw.l);
 #else
         DEBUG_ShowMsg(" st(%u): %s use80=%u val=%.16g (0x%016llx)", i, FPU_tag(fpu.regvalid[adj]),
-                      fpu.use80[adj], fpu.regs[adj].d, (unsigned long long)fpu.regs[adj].ll);
+                       fpu.use80[adj], fpu.regs[adj].v, (unsigned long long)fpu.regs[adj].raw);
 #endif
     }
 
@@ -6239,57 +6341,58 @@ bool CDebugVar::LoadVars(char* name)
 	return true;
 }
 
-static void SaveMemory(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename) {
-	FILE* f = fopen(filename,"wt");
-	if (!f) {
-		DEBUG_ShowMsg("DEBUG: Memory dump failed.\n");
+static void SaveMemory(const char *filename, uint16_t seg, uint32_t ofs1, uint32_t num) {
+	auto address = GetAddress(seg, ofs1);
+	std::ofstream file(filename);
+	if (!file.is_open()) {
+		DEBUG_ShowMsg("DEBUG: Unable to open %s for writing.\n", filename);
 		return;
 	}
 
-	char buffer[128];
-	char temp[16];
-
-	while (num>16) {
-		sprintf(buffer,"%04X:%04X   ",seg,ofs1);
-		for (uint16_t x=0; x<16; x++) {
-			uint8_t value;
-			if (mem_readb_checked((PhysPt)GetAddress(seg,ofs1+x),&value)) sprintf(temp,"%s","?? ");
-			else sprintf(temp,"%02X ",value);
-			strcat(buffer,temp);
+	while (num > 0) {
+		auto row_size = num < 16 ? num : 16;
+		std::ostringstream row;
+		row << std::uppercase << std::hex << std::setfill('0')
+		    << std::setw(4) << seg << ':' << std::setw(4) << ofs1 << "   ";
+		for (uint32_t x = 0; x < row_size; ++x) {
+			uint8_t value = 0;
+			if (mem_readb_checked(address++,&value)) {
+				row << "?? ";
+			} else {
+				row << std::setw(2) << static_cast<unsigned int>(value) << ' ';
+			}
 		}
-		ofs1+=16;
-		num-=16;
-
-		fprintf(f,"%s\n",buffer);
-	}
-	if (num>0) {
-		sprintf(buffer,"%04X:%04X   ",seg,ofs1);
-		for (uint16_t x=0; x<num; x++) {
-			uint8_t value;
-			if (mem_readb_checked((PhysPt)GetAddress(seg,ofs1+x),&value)) sprintf(temp,"%s","?? ");
-			else sprintf(temp,"%02X ",value);
-			strcat(buffer,temp);
+		file << row.str() << '\n';
+		if (!file) {
+			DEBUG_ShowMsg("DEBUG: Memory dump failed.\n");
+			return;
 		}
-		fprintf(f,"%s\n",buffer);
+		ofs1 += row_size;
+		num -= row_size;
 	}
-	fclose(f);
+	file.close();
 	DEBUG_ShowMsg("DEBUG: Memory dump success.\n");
 }
 
-static void SaveMemoryBin(uint16_t seg, uint32_t ofs1, uint32_t num, const char *filename) {
-	FILE* f = fopen(filename,"wb");
-	if (!f) {
-		DEBUG_ShowMsg("DEBUG: Memory binary dump failed.\n");
+static void SaveMemoryBin(const char *filename, uint16_t seg, uint32_t ofs1, uint32_t num) {
+	auto address = GetAddress(seg, ofs1);
+	std::ofstream file(filename, std::ios::binary);
+	if (!file.is_open()) {
+		DEBUG_ShowMsg("DEBUG: Unable to open %s for writing.\n", filename);
 		return;
 	}
 
-	for (uint32_t x = 0; x < num;x++) {
-		uint8_t val;
-		if (mem_readb_checked((PhysPt)GetAddress(seg,ofs1+x),&val)) val=0;
-		fwrite(&val,1,1,f);
+	for (uint32_t x = 0; x < num; ++x) {
+		uint8_t value = 0;
+		mem_readb_checked(address++, &value);
+		file.write((const char*)&value, sizeof(value));
+		if (!file) {
+			DEBUG_ShowMsg("DEBUG: Memory binary dump failed.\n");
+			return;
+		}
 	}
 
-	fclose(f);
+	file.close();
 	DEBUG_ShowMsg("DEBUG: Memory dump binary success.\n");
 }
 
